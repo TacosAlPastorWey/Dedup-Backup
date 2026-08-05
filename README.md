@@ -1,2 +1,2 @@
 # Dedup-Backup
-A simple tool to create a DB for files backup and deduplication.
+A lightweight tool for building a hash-based database to support file backup and deduplication.
