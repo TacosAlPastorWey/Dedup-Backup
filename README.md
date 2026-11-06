@@ -101,7 +101,7 @@ De esta forma es posible aprovechar mejor el ancho de banda de múltiples discos
 ## Instalación
 
 ```bash
-git clone <URL_DEL_REPOSITORIO>
+git clone https://github.com/TacosAlPastorWey/Dedup-Backup
 cd dedup-backup
 
 python3 -m venv .venv
