@@ -1,23 +1,21 @@
 Directory structure:
-└── code/
     ├── README.md
     ├── backup_profiles.json
     ├── consulter_copier.py
+    ├── copia_flush_explicacion.txt
+    ├── digest.txt
     ├── discos_registrados.json
+    ├── disk_listener.log
     ├── explorer_hasher.py
     ├── listener.py
     ├── menu.py
     ├── run_usb_copy.sh
     ├── to_run.txt
-    └── hash_queues/
-        ├── backup_limpio-20260708T233057Z.jsonl
-        ├── backup_limpio-20260708T233057Z.jsonl.status.json
-        ├── disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl.status.json
-        └── disk_e6e2accb7d027956-20260526T142033Z.jsonl.status.json
+    ├── usb_copy_run.log
 
-================================================
+==================================================
 FILE: README.md
-================================================
+==================================================
 # Dedup Backup
 
 Dedup Backup es una herramienta para automatizar respaldos mediante deduplicación basada en contenido. Utiliza el algoritmo **BLAKE3** para identificar archivos de forma única y almacena la información en una base de datos **PostgreSQL**, evitando copiar archivos cuyo contenido ya existe.
@@ -121,7 +119,7 @@ De esta forma es posible aprovechar mejor el ancho de banda de múltiples discos
 ## Instalación
 
 ```bash
-git clone <URL_DEL_REPOSITORIO>
+git clone https://github.com/TacosAlPastorWey/Dedup-Backup
 cd dedup-backup
 
 python3 -m venv .venv
@@ -184,37 +182,19 @@ El proyecto se encuentra en desarrollo activo. Entre las mejoras planeadas se in
 * Métricas de rendimiento y monitoreo.
 * Pruebas automatizadas.
 * Hashing por ssh con calculo local para solo enviar hashes y hacer rsync
+
 ## Licencia
 
 Pendiente de definir.
 
 # Casos de uso
 Si tienes un montón de carpetas de distintas fuentes y no quieres filtrarlas manualmente.
-Si tienes que crear un backup de archivos para comenzando desde cero.
+Si tienes que crear un backup de archivos comenzando desde cero.
 
 
-================================================
-FILE: backup_profiles.json
-================================================
-{
-  "active_profile": "personal",
-  "filename_mode": "first_name",
-  "profiles": {
-    "resistencia": {
-      "db_dsn": "dbname=full_backup user=usr_an0ny password=sincesar1 host=localhost port=5432",
-      "copy_root": "/home/uzr/data_full"
-    },
-    "personal": {
-      "db_dsn": "dbname=personal user=uzr",
-      "copy_root": "/home/uzr/data_full_personal"
-    }
-  }
-}
-
-
-================================================
+==================================================
 FILE: consulter_copier.py
-================================================
+==================================================
 import argparse
 import os
 import re
@@ -225,6 +205,11 @@ import traceback
 from pathlib import Path
 
 import psycopg2
+
+try:
+    from blake3 import blake3
+except ModuleNotFoundError:
+    blake3 = None
 
 from explorer_hasher import (
     DEFAULT_QUEUE_DIR,
@@ -472,9 +457,11 @@ def sanitize_filename(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-def destination_for(destination_root: Path, digest: str, file_meta: dict, filename_mode: str = "hash") -> Path:
+def destination_for(destination_root: Path, digest: str, file_meta: dict, filename_mode: str = "hash") -> tuple[Path, bool]:
+    """Determina la ruta de destino y retorna (path, was_renamed)"""
     extension = (file_meta.get("extension") or "").lower()
     extension_dir = extension.lstrip(".") or "no_ext"
+    was_renamed = False
 
     if filename_mode == "first_name":
         safe_name = sanitize_filename(file_meta.get("name") or digest, digest)
@@ -483,22 +470,28 @@ def destination_for(destination_root: Path, digest: str, file_meta: dict, filena
             safe_name = f"{safe_name}{extension}"
             name_path = Path(safe_name)
         content_dest = destination_root / extension_dir / safe_name
+        
+        # Si existe un archivo con el mismo nombre, usar sufijo file(n)
         if content_dest.exists():
-            expected_size = file_meta.get("size_bytes")
-            try:
-                same_size = expected_size is None or content_dest.stat().st_size == expected_size
-            except OSError:
-                same_size = False
-            if not same_size:
-                suffix = name_path.suffix or extension
-                stem = name_path.stem or digest
-                content_dest = destination_root / extension_dir / f"{stem}-{digest[:12]}{suffix}"
-        return content_dest
+            suffix = name_path.suffix or extension
+            stem = name_path.stem or digest
+            counter = 1
+            while True:
+                new_name = f"{stem}_file({counter}){suffix}"
+                content_dest = destination_root / extension_dir / new_name
+                if not content_dest.exists():
+                    was_renamed = True
+                    break
+                counter += 1
+                if counter > 10000:  # Evitar bucle infinito
+                    raise RuntimeError(f"No se puede crear nombre unico para {stem}")
+        
+        return content_dest, was_renamed
 
     content_dest = destination_root / extension_dir / digest
     if extension:
         content_dest = content_dest.with_suffix(extension)
-    return content_dest
+    return content_dest, was_renamed
 
 
 def copy_file(source_path: str, destination_path: Path):
@@ -514,6 +507,27 @@ def copy_file(source_path: str, destination_path: Path):
             tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def verify_file_hash(file_path: Path, expected_hash: str) -> bool:
+    """Verifica que el hash BLAKE3 del archivo coincida con el esperado."""
+    if blake3 is None:
+        print(f"Advertencia: blake3 no disponible, omitiendo verificacion para {file_path}", file=sys.stderr, flush=True)
+        return True
+    
+    try:
+        hasher = blake3()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        computed_hash = hasher.hexdigest()
+        return computed_hash == expected_hash
+    except Exception as exc:
+        print(f"Error verificando hash de {file_path}: {exc}", file=sys.stderr, flush=True)
+        return False
 
 
 def print_progress(disk_id: str, current: int, total: int):
@@ -551,20 +565,30 @@ def copy_one_file(
     else:
         summary["retried"] += 1
 
-    content_dest = destination_for(destination_root, digest, file_meta, filename_mode)
+    content_dest, was_renamed = destination_for(destination_root, digest, file_meta, filename_mode)
     try:
         expected_size = file_meta.get("size_bytes")
         if content_dest.exists() and (expected_size is None or content_dest.stat().st_size == expected_size):
             update_file_status(conn, file_id, "copied")
             ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
-            summary["copied"] += 1
+            summary["copied_and_verified"] += 1
             return
 
         copy_file(file_meta["path"], content_dest)
-        update_file_status(conn, file_id, "copied")
-        ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
-        summary["copied"] += 1
-        print(f"Copiado {file_meta['path']} -> {content_dest}", flush=True)
+        
+        # Verificar integridad del archivo copiado
+        if verify_file_hash(content_dest, digest):
+            update_file_status(conn, file_id, "copied")
+            ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+            summary["copied_and_verified"] += 1
+            if was_renamed:
+                summary["renamed"] += 1
+            print(f"Copiado y verificado {file_meta['path']} -> {content_dest}", flush=True)
+        else:
+            update_file_status(conn, file_id, "failed")
+            ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+            summary["failed"] += 1
+            print(f"Error de integridad: hash no coincide para {content_dest}", file=sys.stderr, flush=True)
     except Exception as exc:
         update_file_status(conn, file_id, "failed")
         ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
@@ -587,7 +611,8 @@ def copy_files(
         "already_registered": 0,
         "reserved": 0,
         "retried": 0,
-        "copied": 0,
+        "copied_and_verified": 0,
+        "renamed": 0,
         "failed": 0,
         "total_items": total_items,
     }
@@ -760,7 +785,8 @@ def print_summary(summary):
     print(f"  Ya registrados: {summary['already_registered']}")
     print(f"  Reservados para copia: {summary['reserved']}")
     print(f"  Reintentados: {summary['retried']}")
-    print(f"  Copiados: {summary['copied']}")
+    print(f"  Copiados y verificados: {summary.get('copied_and_verified', 0)}")
+    print(f"  Renombrados para evitar conflicto: {summary.get('renamed', 0)}")
     print(f"  Fallidos: {summary['failed']}")
     if summary.get("queue_path"):
         print(f"  Cola: {summary['queue_path']}")
@@ -829,500 +855,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-
-================================================
-FILE: discos_registrados.json
-================================================
-{
-  "disk-19d3fec8b39ac0bd": {
-    "bus": "usb",
-    "device_node": "/dev/sdg",
-    "filesystem": "vfat",
-    "filesystem_uuid": "A690-20D2",
-    "id": "disk-19d3fec8b39ac0bd",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
-    "label": "TAILS",
-    "modelo": "DataTraveler_3.0",
-    "mountpoint": "/media/uzr/TAILS",
-    "nombre": "Kingston DataTraveler 3.0",
-    "particion": "/dev/sdg1",
-    "particion_uuid": "34bf027a-8001-4b93-8243-1f9d3dce7de7",
-    "particiones_uuid": [
-      "fsuuid:A690-20D2",
-      "partuuid:34bf027a-8001-4b93-8243-1f9d3dce7de7"
-    ],
-    "primer_registro": "2026-05-23T06:08:41.937996+00:00",
-    "serial": "Kingston_DataTraveler_3.0_4CEDFB72A4481681F9041E1A-0:0",
-    "sys_name": "sdg",
-    "tabla_particiones_uuid": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
-    "ultima_vez_visto": "2026-05-23T17:53:43.698484+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-24d8269ef37273e6": {
-    "bus": "usb",
-    "device_node": "/dev/sdf",
-    "filesystem": "vfat",
-    "filesystem_uuid": "77CD-2E90",
-    "id": "disk-24d8269ef37273e6",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "3b71049d",
-    "label": "KINGSTON",
-    "modelo": "DataTraveler_3.0",
-    "mountpoint": "/media/uzr/KINGSTON",
-    "nombre": "Kingston DataTraveler 3.0",
-    "particion": "/dev/sdf1",
-    "particion_uuid": "3b71049d-01",
-    "particiones_uuid": [
-      "fsuuid:77CD-2E90",
-      "partuuid:3b71049d-01"
-    ],
-    "primer_registro": "2026-05-23T05:59:04.923423+00:00",
-    "serial": "Kingston_DataTraveler_3.0_E0D55E6B6369F4608929731E-0:0",
-    "sys_name": "sdf",
-    "tabla_particiones_uuid": "3b71049d",
-    "ultima_vez_visto": "2026-05-23T19:44:44.110112+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-344daeff8e20297a": {
-    "bus": "ata",
-    "device_node": "/dev/sdc1",
-    "filesystem": "ntfs",
-    "filesystem_uuid": "C6BCA8A9BCA89589",
-    "id": "disk-344daeff8e20297a",
-    "id_fuente": "wwn",
-    "id_valor": "0x5000039c22f0a85d",
-    "label": "ADATA_HD710_PRO",
-    "modelo": "TOSHIBA_MQ04ABF100",
-    "mountpoint": "/media/uzr/ADATA HD710 PRO",
-    "nombre": "ADATA TOSHIBA MQ04ABF100",
-    "particion": "/dev/sdc2",
-    "particion_uuid": "1851f49f-aee6-4732-9a12-06a11b2f58a4",
-    "particiones_uuid": [
-      "fsuuid:C6BCA8A9BCA89589",
-      "partuuid:1851f49f-aee6-4732-9a12-06a11b2f58a4",
-      "partuuid:991a80d9-e2fd-4e98-b0f0-9c601745c204"
-    ],
-    "primer_registro": "2026-05-23T04:15:51.902740+00:00",
-    "serial": "TOSHIBA_MQ04ABF100_339SP22GT",
-    "sys_name": "sdc1",
-    "tabla_particiones_uuid": "eabfba6b-0181-4035-831f-0b035cacc9e5",
-    "ultima_vez_visto": "2026-05-23T20:58:24.659144+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "ADATA",
-    "wwn": "0x5000039c22f0a85d"
-  },
-  "disk-470c8fc311389738": {
-    "bus": "usb",
-    "device_node": "/dev/sdg",
-    "filesystem": "vfat",
-    "filesystem_uuid": "2801-80A0",
-    "id": "disk-470c8fc311389738",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "3d05a00b",
-    "modelo": "Flash_Disk",
-    "mountpoint": "/media/uzr/2801-80A0",
-    "nombre": "Generic Flash Disk",
-    "particion": "/dev/sdg1",
-    "particion_uuid": "3d05a00b-01",
-    "particiones_uuid": [
-      "fsuuid:2801-80A0",
-      "partuuid:3d05a00b-01"
-    ],
-    "primer_registro": "2026-05-23T03:19:34.794411+00:00",
-    "serial": "Generic_Flash_Disk_6EE6846D-0:0",
-    "sys_name": "sdg",
-    "tabla_particiones_uuid": "3d05a00b",
-    "ultima_vez_visto": "2026-05-23T19:59:13.149770+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Generic"
-  },
-  "disk-4d666dad805f475e": {
-    "bus": "usb",
-    "device_node": "/dev/sde",
-    "filesystem": "exfat",
-    "filesystem_uuid": "A8D0-97D4",
-    "id": "disk-4d666dad805f475e",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "fa2f0801",
-    "label": "KINGSTON",
-    "modelo": "DataTraveler_3.0",
-    "mountpoint": "/media/uzr/KINGSTON",
-    "nombre": "Kingston DataTraveler 3.0",
-    "particion": "/dev/sde1",
-    "particion_uuid": "fa2f0801-01",
-    "particiones_uuid": [
-      "fsuuid:A8D0-97D4",
-      "partuuid:fa2f0801-01"
-    ],
-    "primer_registro": "2026-05-23T05:59:08.284379+00:00",
-    "serial": "Kingston_DataTraveler_3.0_40B0767E23B7E48126522AD8-0:0",
-    "sys_name": "sde",
-    "tabla_particiones_uuid": "fa2f0801",
-    "ultima_vez_visto": "2026-05-23T19:43:28.336571+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-5057efcd339363e0": {
-    "bus": "usb",
-    "device_node": "/dev/sde",
-    "filesystem": "vfat",
-    "filesystem_uuid": "3065-C3CF",
-    "id": "disk-5057efcd339363e0",
-    "id_fuente": "serial",
-    "id_valor": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
-    "label": "BLACK",
-    "modelo": "Cruzer_Edge",
-    "mountpoint": "/media/uzr/BLACK",
-    "nombre": "SanDisk Cruzer Edge",
-    "particion": "/dev/sde1",
-    "particiones_uuid": [
-      "fsuuid:3065-C3CF"
-    ],
-    "primer_registro": "2026-05-23T16:41:29.657839+00:00",
-    "serial": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
-    "sys_name": "sde",
-    "ultima_vez_visto": "2026-05-23T19:44:44.072987+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "SanDisk"
-  },
-  "disk-56abd2c1ddd7997d": {
-    "bus": "usb",
-    "device_node": "/dev/sdd",
-    "filesystem": "vfat",
-    "filesystem_uuid": "1CD1-48FD",
-    "id": "disk-56abd2c1ddd7997d",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "1c7dbc41",
-    "label": "HERRERAMED",
-    "modelo": "STORE_N_GO",
-    "mountpoint": "/media/uzr/HERRERAMED",
-    "nombre": "Verbatim STORE N GO",
-    "particion": "/dev/sdd1",
-    "particion_uuid": "1c7dbc41-01",
-    "particiones_uuid": [
-      "fsuuid:1CD1-48FD",
-      "partuuid:1c7dbc41-01"
-    ],
-    "primer_registro": "2026-05-23T05:57:57.704053+00:00",
-    "serial": "Verbatim_STORE_N_GO_90009438A73A9904-0:0",
-    "sys_name": "sdd",
-    "tabla_particiones_uuid": "1c7dbc41",
-    "ultima_vez_visto": "2026-05-23T19:44:44.028928+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Verbatim"
-  },
-  "disk-6ce17bf2a5aed44b": {
-    "bus": "usb",
-    "device_node": "/dev/sdg",
-    "filesystem": "vfat",
-    "filesystem_uuid": "6653-46B7",
-    "id": "disk-6ce17bf2a5aed44b",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "013853b7",
-    "label": "KINGSTON",
-    "modelo": "DataTraveler_3.0",
-    "mountpoint": "/media/uzr/KINGSTON1",
-    "nombre": "Kingston DataTraveler 3.0",
-    "particion": "/dev/sdg1",
-    "particion_uuid": "013853b7-01",
-    "particiones_uuid": [
-      "fsuuid:6653-46B7",
-      "partuuid:013853b7-01"
-    ],
-    "primer_registro": "2026-05-23T06:02:04.747452+00:00",
-    "serial": "Kingston_DataTraveler_3.0_E0D55EA573D217309934035F-0:0",
-    "sys_name": "sdg",
-    "tabla_particiones_uuid": "013853b7",
-    "ultima_vez_visto": "2026-05-23T19:44:44.041656+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-7ded812abdce0156": {
-    "bus": "usb",
-    "device_node": "/dev/sdc",
-    "filesystem": "vfat",
-    "filesystem_uuid": "C6DB-AA8C",
-    "id": "disk-7ded812abdce0156",
-    "id_fuente": "partition_uuids",
-    "id_valor": "fsuuid:C6DB-AA8C",
-    "label": "GADEA",
-    "modelo": "U3_Cruzer_Micro",
-    "mountpoint": "/media/uzr/GADEA",
-    "nombre": "GADEA",
-    "particion": "/dev/sdc1",
-    "particiones_uuid": [
-      "fsuuid:C6DB-AA8C"
-    ],
-    "primer_registro": "2026-05-23T17:58:10.299299+00:00",
-    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:0",
-    "sys_name": "sdc",
-    "ultima_vez_visto": "2026-05-23T19:49:55.941072+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "SanDisk"
-  },
-  "disk-95cf1c27fd544126": {
-    "bus": "usb",
-    "device_node": "/dev/sdf",
-    "filesystem": "vfat",
-    "filesystem_uuid": "622D-846B",
-    "id": "disk-95cf1c27fd544126",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "360862dc",
-    "label": "CT_UMF_23",
-    "modelo": "TransMemory",
-    "mountpoint": "/media/uzr/CT UMF 23",
-    "nombre": "TOSHIBA TransMemory",
-    "particion": "/dev/sdf1",
-    "particion_uuid": "360862dc-01",
-    "particiones_uuid": [
-      "fsuuid:622D-846B",
-      "partuuid:360862dc-01"
-    ],
-    "primer_registro": "2026-05-23T04:15:49.751781+00:00",
-    "serial": "TOSHIBA_TransMemory_E9AA4B29FE1FCD91A3E8BA11-0:0",
-    "sys_name": "sdf",
-    "tabla_particiones_uuid": "360862dc",
-    "ultima_vez_visto": "2026-05-23T19:59:13.087904+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "TOSHIBA"
-  },
-  "disk-99a75b8a7f0dda90": {
-    "bus": "usb",
-    "device_node": "/dev/sde",
-    "filesystem": "vfat",
-    "filesystem_uuid": "BD6A-A610",
-    "id": "disk-99a75b8a7f0dda90",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "bdc28f98",
-    "label": "USB_DISK",
-    "modelo": "USB_DISK_2.0",
-    "mountpoint": "/media/uzr/USB DISK",
-    "nombre": "\\x20\\x20\\x20\\x20\\x20\\x20\\x20\\x20 USB DISK 2.0",
-    "particion": "/dev/sde1",
-    "particion_uuid": "bdc28f98-01",
-    "particiones_uuid": [
-      "fsuuid:BD6A-A610",
-      "partuuid:bdc28f98-01"
-    ],
-    "primer_registro": "2026-05-23T06:03:48.091970+00:00",
-    "serial": "_USB_DISK_2.0_07083872D31B4A95-0:0",
-    "sys_name": "sde",
-    "tabla_particiones_uuid": "bdc28f98",
-    "ultima_vez_visto": "2026-05-23T19:59:13.026848+00:00",
-    "ultimo_evento": "disconnect"
-  },
-  "disk-9e4d787bfc4890b9": {
-    "bus": "usb",
-    "device_node": "/dev/sdh",
-    "filesystem": "exfat",
-    "filesystem_uuid": "A2EA-8993",
-    "id": "disk-9e4d787bfc4890b9",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "004439c0",
-    "label": "KINGSTON",
-    "modelo": "DataTraveler_3.0",
-    "mountpoint": "/media/uzr/KINGSTON",
-    "nombre": "Kingston DataTraveler 3.0",
-    "particion": "/dev/sdh1",
-    "particion_uuid": "004439c0-01",
-    "particiones_uuid": [
-      "fsuuid:A2EA-8993",
-      "partuuid:004439c0-01"
-    ],
-    "primer_registro": "2026-05-23T06:06:38.927414+00:00",
-    "serial": "Kingston_DataTraveler_3.0_E0D55E6C382B168139430176-0:0",
-    "sys_name": "sdh",
-    "tabla_particiones_uuid": "004439c0",
-    "ultima_vez_visto": "2026-05-23T19:59:13.056144+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-b95a23446c60cfdf": {
-    "bus": "usb",
-    "device_node": "/dev/sdg",
-    "filesystem": "vfat",
-    "filesystem_uuid": "1605-112C",
-    "id": "disk-b95a23446c60cfdf",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "028d17d6",
-    "label": "DPE_EVA",
-    "modelo": "USB_Flash_Drive",
-    "mountpoint": "/media/uzr/DPE_EVA",
-    "nombre": "ADATA USB Flash Drive",
-    "particion": "/dev/sdg1",
-    "particion_uuid": "028d17d6-01",
-    "particiones_uuid": [
-      "fsuuid:1605-112C",
-      "partuuid:028d17d6-01"
-    ],
-    "primer_registro": "2026-05-23T06:03:42.834626+00:00",
-    "serial": "ADATA_USB_Flash_Drive_29236003-0:0",
-    "sys_name": "sdg",
-    "tabla_particiones_uuid": "028d17d6",
-    "ultima_vez_visto": "2026-05-23T19:43:28.341776+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "ADATA"
-  },
-  "disk-db31b958c725e9e4": {
-    "bus": "usb",
-    "device_node": "/dev/sr0",
-    "id": "disk-db31b958c725e9e4",
-    "id_fuente": "serial",
-    "id_valor": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
-    "modelo": "U3_Cruzer_Micro",
-    "nombre": "SanDisk U3 Cruzer Micro",
-    "primer_registro": "2026-05-23T17:58:19.025321+00:00",
-    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
-    "sys_name": "sr0",
-    "ultima_vez_visto": "2026-05-23T19:43:28.462422+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "SanDisk"
-  },
-  "disk-db3f0d67ba566616": {
-    "bus": "usb",
-    "device_node": "/dev/sdd",
-    "filesystem": "vfat",
-    "filesystem_uuid": "EE2B-50C8",
-    "id": "disk-db3f0d67ba566616",
-    "id_fuente": "partition_uuids",
-    "id_valor": "fsuuid:EE2B-50C8",
-    "label": "KINGSTON",
-    "modelo": "DataTraveler_2.0",
-    "mountpoint": "/media/uzr/KINGSTON1",
-    "nombre": "KINGSTON",
-    "particion": "/dev/sdd1",
-    "particiones_uuid": [
-      "fsuuid:EE2B-50C8"
-    ],
-    "primer_registro": "2026-05-23T06:01:07.155098+00:00",
-    "serial": "Kingston_DataTraveler_2.0_5B7B1A00005C-0:0",
-    "sys_name": "sdd",
-    "ultima_vez_visto": "2026-05-23T19:43:28.383918+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "Kingston"
-  },
-  "disk-dc9d10b9b2739f2f": {
-    "bus": "ata",
-    "device_node": "/dev/sdb1",
-    "filesystem": "ntfs",
-    "filesystem_uuid": "C21A36381A362A35",
-    "id": "disk-dc9d10b9b2739f2f",
-    "id_fuente": "wwn",
-    "id_valor": "0x5000039c9b30371a",
-    "label": "MARTHA_DOLI_(INFO_RECIENTE)",
-    "modelo": "TOSHIBA_MQ04ABF100",
-    "mountpoint": "/media/uzr/MARTHA DOLI (INFO RECIENTE)",
-    "nombre": "ADATA TOSHIBA MQ04ABF100",
-    "particion": "/dev/sdb2",
-    "particion_uuid": "663f33be-da0e-4468-9fe4-f43a54307855",
-    "particiones_uuid": [
-      "fsuuid:C21A36381A362A35",
-      "partuuid:663f33be-da0e-4468-9fe4-f43a54307855",
-      "partuuid:c992c99d-1fb8-4f25-b8d7-bbd5b88ceeb0"
-    ],
-    "primer_registro": "2026-05-23T04:15:58.051456+00:00",
-    "serial": "TOSHIBA_MQ04ABF100_X3JSP3E0T",
-    "sys_name": "sdb1",
-    "tabla_particiones_uuid": "9906a8aa-df31-43a8-b9c4-bcf79588f640",
-    "ultima_vez_visto": "2026-05-26T17:09:26.939388+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "ADATA",
-    "wwn": "0x5000039c9b30371a"
-  },
-  "disk-e170ff5d93b39289": {
-    "bus": "usb",
-    "device_node": "/dev/sdb",
-    "filesystem": "vfat",
-    "filesystem_uuid": "F49C-63A1",
-    "id": "disk-e170ff5d93b39289",
-    "id_fuente": "partition_table_uuid",
-    "id_valor": "c3072e18",
-    "label": "HP_v125w",
-    "modelo": "v125w",
-    "mountpoint": "/media/uzr/HP v125w",
-    "nombre": "hp v125w",
-    "particion": "/dev/sdb1",
-    "particion_uuid": "c3072e18-01",
-    "particiones_uuid": [
-      "fsuuid:F49C-63A1",
-      "partuuid:c3072e18-01"
-    ],
-    "primer_registro": "2026-05-23T03:20:47.859111+00:00",
-    "serial": "hp_v125w_AA17141D00000199-0:0",
-    "sys_name": "sdb",
-    "tabla_particiones_uuid": "c3072e18",
-    "ultima_vez_visto": "2026-05-23T19:59:52.189655+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "hp"
-  },
-  "disk-e3b4f365b74cbe9e": {
-    "bus": "scsi",
-    "device_node": "/dev/sda",
-    "id": "disk-e3b4f365b74cbe9e",
-    "id_fuente": "weak_hardware_fallback",
-    "id_valor": "scsi",
-    "nombre": "/dev/sda",
-    "primer_registro": "2026-05-23T04:15:57.524025+00:00",
-    "sys_name": "sda",
-    "ultima_vez_visto": "2026-05-26T05:50:18.511171+00:00",
-    "ultimo_evento": "disconnect"
-  },
-  "disk-e6e2accb7d027956": {
-    "bus": "scsi",
-    "device_node": "/dev/sda3",
-    "filesystem": "ntfs",
-    "filesystem_uuid": "58ACC9AFACC98848",
-    "id": "disk-e6e2accb7d027956",
-    "id_fuente": "wwn",
-    "id_valor": "0x3043208463202400",
-    "label": "Reservado_para_el_sistema",
-    "modelo": "XPG_EX500",
-    "mountpoint": "/media/uzr/58ACC9AFACC98848",
-    "nombre": "ADATA XPG EX500",
-    "particion": "/dev/sda2",
-    "particion_uuid": "571a8e1c-02",
-    "particiones_uuid": [
-      "fsuuid:58ACC9AFACC98848",
-      "fsuuid:AC98C6FB98C6C2D6",
-      "fsuuid:BC1A50891A504316",
-      "partuuid:571a8e1c-01",
-      "partuuid:571a8e1c-02",
-      "partuuid:571a8e1c-03"
-    ],
-    "primer_registro": "2026-05-23T04:16:03.555766+00:00",
-    "serial": "1ADATA_XPG_EX500_4320846C20B4",
-    "sys_name": "sda3",
-    "tabla_particiones_uuid": "571a8e1c",
-    "ultima_vez_visto": "2026-05-26T17:09:27.209987+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "ADATA",
-    "wwn": "0x3043208463202400"
-  },
-  "disk-f4a2a59b894b550c": {
-    "bus": "scsi",
-    "device_node": "/dev/sda",
-    "id": "disk-f4a2a59b894b550c",
-    "id_fuente": "wwn",
-    "id_valor": "0x5000000000000001",
-    "modelo": "ED600",
-    "nombre": "ADATA ED600",
-    "primer_registro": "2026-05-26T05:48:19.172826+00:00",
-    "serial": "35000000000000001",
-    "sys_name": "sda",
-    "ultima_vez_visto": "2026-05-26T05:49:25.897890+00:00",
-    "ultimo_evento": "disconnect",
-    "vendor": "ADATA",
-    "wwn": "0x5000000000000001"
-  }
-}
-
-
-================================================
+==================================================
 FILE: explorer_hasher.py
-================================================
+==================================================
 import argparse
 import json
 import os
@@ -1683,10 +1218,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-
-================================================
+==================================================
 FILE: listener.py
-================================================
+==================================================
 import argparse
 import getpass
 import hashlib
@@ -2638,10 +2172,9 @@ if __name__ == "__main__":
     app.iniciar()
 
 
-
-================================================
+==================================================
 FILE: menu.py
-================================================
+==================================================
 import getpass
 import json
 import os
@@ -2915,6 +2448,22 @@ def validate_manual_path(raw_path: str) -> tuple[bool, Path | None, str]:
     return True, path, ""
 
 
+def validate_manual_file(raw_path: str) -> tuple[bool, Path | None, str]:
+    if not raw_path.strip():
+        return False, None, "No se ingreso ruta."
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        return False, path, "El archivo no existe o no esta accesible."
+    if not path.is_file():
+        return False, path, "La ruta existe, pero no es un archivo."
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+    except OSError as e:
+        return False, path, f"El archivo no es legible: {e}"
+    return True, path, ""
+
+
 def render_progress(current: int, total: int, width: int = 34):
     if total <= 0:
         sys.stdout.write(f"\rProcesados {current} archivos...")
@@ -3021,6 +2570,35 @@ def manual_path(config: dict):
     run_copier_for_path(config, path, disk_id)
 
 
+def manual_file(config: dict):
+    import tempfile
+    raw_path = prompt("Ruta del archivo a respaldar")
+    ok, path, message = validate_manual_file(raw_path)
+    if not ok:
+        print(message)
+        return
+    assert path is not None
+    disk_id = prompt("Nombre para esta ejecucion", path.stem or "archivo")
+
+    # Crear directorio temporal para el archivo
+    temp_dir = Path(tempfile.mkdtemp(prefix="consulter_file_"))
+    try:
+        # Crear enlace simbólico al archivo en el directorio temporal
+        temp_file = temp_dir / path.name
+        temp_file.symlink_to(path)
+        print(f"Archivo enlazado en: {temp_dir}")
+        run_copier_for_path(config, temp_dir, disk_id)
+    finally:
+        # Limpiar directorio temporal
+        try:
+            for item in temp_dir.iterdir():
+                if item.is_symlink() or item.is_file():
+                    item.unlink()
+            temp_dir.rmdir()
+        except Exception as e:
+            print(f"Advertencia: No se pudo limpiar {temp_dir}: {e}")
+
+
 def main():
     config = load_config()
     while True:
@@ -3031,7 +2609,8 @@ def main():
         print(f"Modo nombre: {config.get('filename_mode', 'hash')}")
         print(" 1. Iniciar desde disco conectado")
         print(" 2. Iniciar desde una carpeta/ruta")
-        print(" 3. Configurar")
+        print(" 3. Iniciar desde un archivo individual")
+        print(" 4. Configurar")
         print(" q. Salir")
         try:
             choice = input("Opcion: ").strip().lower()
@@ -3043,6 +2622,8 @@ def main():
         elif choice == "2":
             manual_path(config)
         elif choice == "3":
+            manual_file(config)
+        elif choice == "4":
             configure(config)
         elif choice in {"q", "quit", "salir"}:
             break
@@ -3054,10 +2635,9 @@ if __name__ == "__main__":
     main()
 
 
-
-================================================
+==================================================
 FILE: run_usb_copy.sh
-================================================
+==================================================
 #!/bin/bash
 set -euo pipefail
 
@@ -3144,146 +2724,896 @@ echo "USB copy run finished: $(date +'%F %T')"
 echo "========================================"
 
 
+==================================================
+FILE: copia_flush_explicacion.txt
+==================================================
+# para copiar todo lo del nvme al hdd
+sudo rsync -aH --info=progress2 --human-readable \
+  /home/uzr/data_full/ \
+  /mnt/backup_resistencia/FULL/
+# Verificacion
+sudo rsync -aHn \
+  /home/uzr/data_full/ \
+  /mnt/backup_resistencia/FULL/
 
-================================================
+# Limpiez con enlaces simbolicos incluidos
+sudo find /home/uzr/data_full -type f -o -type l
+# limpieza 2 sudo find /home/uzr/data_full -type f -delete
+
+
+
+
+==================================================
 FILE: to_run.txt
-================================================
+==================================================
 /home/uzr/v_envs/Scrapper/bin/python3 /home/uzr/code/listener_2.py --db-dsn 'dbname=scrapper' --output-root /home/uzr/data_full
 /home/uzr/v_envs/Scrapper/bin/python /home/uzr/code/menu.py
 
-
-================================================
-FILE: hash_queues/backup_limpio-20260708T233057Z.jsonl
-================================================
-{"extension": ".pdf", "hash": "c5e65a97a4cc4acebb0bc4990d7d15e4e86aa32427e461b1e84214a46edc03d6", "modified_at": "2024-06-14T21:35:22+00:00", "name": "LuisÁngelRamosGarcía_tesis.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LuisÁngelRamosGarcía_tesis.pdf", "relative_path": "pdf/LuisÁngelRamosGarcía_tesis.pdf", "size_bytes": 1246533}
-{"extension": ".pdf", "hash": "45613f5227525985f79ed3c34d7efdecac0d6fe00c8f8b91e1797a4d15a6c6df", "modified_at": "2024-06-13T22:51:12+00:00", "name": "REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "relative_path": "pdf/REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "size_bytes": 225392}
-{"extension": ".pdf", "hash": "0e55638573c37ea0c3682691ddbec4c58f5ba1eb3511efda84b9eac2dfa3e19b", "modified_at": "2023-03-06T01:21:49+00:00", "name": "Prob1-2016.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Prob1-2016.pdf", "relative_path": "pdf/Prob1-2016.pdf", "size_bytes": 5161261}
-{"extension": ".pdf", "hash": "8df25c08c112f71499ccc1b0103d41573729b5715e8b3013ed310c8c3a5c8fda", "modified_at": "2022-08-20T17:51:26+00:00", "name": "Speech and Language Processing - Jurafsky.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Speech and Language Processing - Jurafsky.pdf", "relative_path": "pdf/Speech and Language Processing - Jurafsky.pdf", "size_bytes": 19095165}
-{"extension": ".pdf", "hash": "543c0bc2e4bcc73f8e483b7b64f1d23914a6459eb06df68f386cc6c4f8d8caa5", "modified_at": "2025-07-01T20:15:22.740728+00:00", "name": "Toma de materias.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Toma de materias.pdf", "relative_path": "pdf/Toma de materias.pdf", "size_bytes": 361160}
-{"extension": ".pdf", "hash": "5bb353b4763d6e993bef0f53a51e242c3ca0b4655d193b20e985ccc1e7c840fd", "modified_at": "2023-06-02T05:17:16.200418+00:00", "name": "James_Clustering_pdf.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/James_Clustering_pdf.pdf", "relative_path": "pdf/James_Clustering_pdf.pdf", "size_bytes": 1348174}
-{"extension": ".pdf", "hash": "b86f66be5d30e3359dba0737bba782d921a23c481eabd9c85bc50edb19eca304", "modified_at": "2023-05-09T20:17:05+00:00", "name": "neurons_rojas.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/neurons_rojas.pdf", "relative_path": "pdf/neurons_rojas.pdf", "size_bytes": 4576797}
-{"extension": ".pdf", "hash": "2fd4818e4f32b184371547d2ca35900b0bc0651bc754ecb99fb853d1172e2af2", "modified_at": "2024-04-25T19:02:57+00:00", "name": "Spherical_k-Means_Clustering.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Spherical_k-Means_Clustering.pdf", "relative_path": "pdf/Spherical_k-Means_Clustering.pdf", "size_bytes": 406887}
-{"extension": ".pdf", "hash": "383076066d199ae0348fadde8f834c4ee3ca6da4f630a2271888d1fce7cf1531", "modified_at": "2024-06-15T02:47:40+00:00", "name": "LuisÁngelRamosGarcía_formato.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LuisÁngelRamosGarcía_formato.pdf", "relative_path": "pdf/LuisÁngelRamosGarcía_formato.pdf", "size_bytes": 9888227}
-{"extension": ".pdf", "hash": "2432a388e1f26278aafe3bb4113af18bdf268df0a6ba9c8facca4008997f5f4b", "modified_at": "2022-12-14T19:48:30+00:00", "name": "Procesos_Estocasticos.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Procesos_Estocasticos.pdf", "relative_path": "pdf/Procesos_Estocasticos.pdf", "size_bytes": 177100}
-{"extension": ".pdf", "hash": "3f84e2cb742df885ff84ef9be08c038ffd154516a93f76a457d33bcbcf1fbc02", "modified_at": "2022-08-29T00:08:46+00:00", "name": "Solicitud.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solicitud.pdf", "relative_path": "pdf/Solicitud.pdf", "size_bytes": 83192}
-{"extension": ".pdf", "hash": "3828f11964d315f4c796bad5d9a36bd397bad3fec3cd6893c8c3fbe318e6235e", "modified_at": "2024-05-20T17:54:26+00:00", "name": "Presentacion_Final_Anteproyecto.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Presentacion_Final_Anteproyecto.pdf", "relative_path": "pdf/Presentacion_Final_Anteproyecto.pdf", "size_bytes": 1673098}
-{"extension": ".pdf", "hash": "aaba6c5f08736c80a0234242a0012b5209405ccf7111cde4e51fc8b57191f974", "modified_at": "2024-06-14T21:28:49+00:00", "name": "Tesis_James (2).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James (2).pdf", "relative_path": "pdf/Tesis_James (2).pdf", "size_bytes": 874206}
-{"extension": ".pdf", "hash": "8b7ddb4842d1a717d549d5bddb8b24a2518621c9cb8807a0891a59dc59a382c6", "modified_at": "2023-02-10T23:03:43+00:00", "name": "vigenciaimss.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/vigenciaimss.pdf", "relative_path": "pdf/vigenciaimss.pdf", "size_bytes": 54160}
-{"extension": ".pdf", "hash": "90eed5e6ed36ee850c22ce1c175729686fa092124442e96e6685835a143c45bc", "modified_at": "2023-02-16T01:51:46+00:00", "name": "RECIBO_0005598FEB2023.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/RECIBO_0005598FEB2023.pdf", "relative_path": "pdf/RECIBO_0005598FEB2023.pdf", "size_bytes": 181141}
-{"extension": ".pdf", "hash": "7c5bbf963e2521f5d67e496b9903dd5217e89d27d715dc0715e60c5136d3618b", "modified_at": "2023-11-07T17:54:23+00:00", "name": "NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "relative_path": "pdf/NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "size_bytes": 93960}
-{"extension": ".pdf", "hash": "563e6c1641ed2ce6e62972633979900d5f6b588f016cec6d63a3948ce841456f", "modified_at": "2024-06-13T23:01:14+00:00", "name": "VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "relative_path": "pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "size_bytes": 371777}
-{"extension": ".pdf", "hash": "429ec2449eaa4e007c7da9b2a90db439283d0026138465e88279f5bb3d51828c", "modified_at": "2022-08-20T17:51:13+00:00", "name": "Manning_Schuetze_StatisticalNLP.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Manning_Schuetze_StatisticalNLP.pdf", "relative_path": "pdf/Manning_Schuetze_StatisticalNLP.pdf", "size_bytes": 11910301}
-{"extension": ".pdf", "hash": "4f801705dafcad98e3e915dfc3f9931b612bdd96c9ad576c8ae6d4016aca1dc5", "modified_at": "2023-03-30T01:49:04+00:00", "name": "Solucion_Tarea_01_PROBABILIDAD.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_01_PROBABILIDAD.pdf", "relative_path": "pdf/Solucion_Tarea_01_PROBABILIDAD.pdf", "size_bytes": 3851565}
-{"extension": ".pdf", "hash": "8d786755a0d1daa34e22effda3b4fb7854ab1fefaf4a07662f772dd8bda99325", "modified_at": "2023-05-02T21:45:01+00:00", "name": "Procesamiento_Predictivo.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Procesamiento_Predictivo.pdf", "relative_path": "pdf/Procesamiento_Predictivo.pdf", "size_bytes": 3373212}
-{"extension": ".pdf", "hash": "db83f41ff0a4650ba106585bc46411d86db1bac00291d14e129b612a9908f4d9", "modified_at": "2022-12-05T08:01:20+00:00", "name": "por si no hay net xd modelacion.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/por si no hay net xd modelacion.pdf", "relative_path": "pdf/por si no hay net xd modelacion.pdf", "size_bytes": 2371922}
-{"extension": ".pdf", "hash": "e74c90fd5718c1c51d3b5eb4e33b31317145f71ad8b0416528e5a40fe6ca35d0", "modified_at": "2025-07-01T20:02:20.031571+00:00", "name": "Seminarios (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Seminarios (1).pdf", "relative_path": "pdf/Seminarios (1).pdf", "size_bytes": 592024}
-{"extension": ".pdf", "hash": "5c4c75d3b976d7c79c9335ffc81e16eb70ec223703bec861e9098232534e120c", "modified_at": "2023-06-20T01:40:50+00:00", "name": "pre-pre(preresidenciaypre-presentacion).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/pre-pre(preresidenciaypre-presentacion).pdf", "relative_path": "pdf/pre-pre(preresidenciaypre-presentacion).pdf", "size_bytes": 10040713}
-{"extension": ".pdf", "hash": "a401fe7f62235c0f7b8783bba5151045783ade71cf1a022aa1216b99688ca6e4", "modified_at": "2023-03-12T18:20:46+00:00", "name": "minicv.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/minicv.pdf", "relative_path": "pdf/minicv.pdf", "size_bytes": 2408512}
-{"extension": ".pdf", "hash": "da784f6ba9d92ca8bbbb5342a4bda3b0a8380f2bbfda94a7a885f42ced2ee2c6", "modified_at": "2022-09-26T13:32:05+00:00", "name": "tutoriaRamos.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/tutoriaRamos.pdf", "relative_path": "pdf/tutoriaRamos.pdf", "size_bytes": 194679}
-{"extension": ".pdf", "hash": "238cd8757d89eba75c71dcc537e7eb4af064a25877ff9057d29511c3193bfbcd", "modified_at": "2023-03-06T01:21:58+00:00", "name": "procesos2012.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/procesos2012.pdf", "relative_path": "pdf/procesos2012.pdf", "size_bytes": 1913766}
-{"extension": ".pdf", "hash": "adc9c4e32dba8536a44f9d03f32b8b85041d6fb0a03fa6342be41c74dc2e95fc", "modified_at": "2024-12-05T21:12:08.410906+00:00", "name": "MC Luis Ángel Ramos García ANEXO_UNO.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/MC Luis Ángel Ramos García ANEXO_UNO.pdf", "relative_path": "pdf/MC Luis Ángel Ramos García ANEXO_UNO.pdf", "size_bytes": 280100}
-{"extension": ".pdf", "hash": "25eb41d98cefa639c8c77e7dc15543023e803320ac2b506e72b73c69f4080122", "modified_at": "2025-09-18T15:28:23.886612+00:00", "name": "POLIZA_WEB_93001634772147220267.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/POLIZA_WEB_93001634772147220267.pdf", "relative_path": "pdf/POLIZA_WEB_93001634772147220267.pdf", "size_bytes": 238674}
-{"extension": ".pdf", "hash": "ceee9444e8dbcdf639112a597801b60681779124aab736a235a71433d6116f17", "modified_at": "2025-09-07T15:32:20.037380+00:00", "name": "CFD_93001634772147220267.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/CFD_93001634772147220267.pdf", "relative_path": "pdf/CFD_93001634772147220267.pdf", "size_bytes": 193426}
-{"extension": ".pdf", "hash": "f879f4152d654192b6c7d9d916b8973d37e959945d684acaf5b72e73bcc1fda8", "modified_at": "2023-06-20T03:16:42+00:00", "name": "test1-presentacion-pre.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/test1-presentacion-pre.pdf", "relative_path": "pdf/test1-presentacion-pre.pdf", "size_bytes": 10916024}
-{"extension": ".pdf", "hash": "db879b945910bc32d42bfcffd1e1220218c7465276f4246a8d36fc194fd9283c", "modified_at": "2023-09-19T17:33:50+00:00", "name": "Ramos García Luis Ángel.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos García Luis Ángel.pdf", "relative_path": "pdf/Ramos García Luis Ángel.pdf", "size_bytes": 118419}
-{"extension": ".pdf", "hash": "6ff9b255080999dd97119c7cc843c39eda223641658c7810e48716d9b54a8330", "modified_at": "2023-03-30T01:49:20+00:00", "name": "Solucion_Tarea_02_PROBABILIDAD (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_02_PROBABILIDAD (1).pdf", "relative_path": "pdf/Solucion_Tarea_02_PROBABILIDAD (1).pdf", "size_bytes": 9606988}
-{"extension": ".pdf", "hash": "7a66e4008a30af811871d0437b1121a536ab013b733babae017c981ac7c3223d", "modified_at": "2025-07-01T19:50:02.735336+00:00", "name": "MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "relative_path": "pdf/MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "size_bytes": 325632}
-{"extension": ".pdf", "hash": "b9358d1c7a8696f0d2db75fea0e9dc101767644a725c4b95cbcfe5542c031053", "modified_at": "2025-07-01T19:49:46.154172+00:00", "name": "Ramos_Garcia_Luis_Angel_FEDB.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos_Garcia_Luis_Angel_FEDB.pdf", "relative_path": "pdf/Ramos_Garcia_Luis_Angel_FEDB.pdf", "size_bytes": 274356}
-{"extension": ".pdf", "hash": "4c6ba3780ca5f1d21a94c37035444dccc0a510e34d6db3f5afe1c52b1933486c", "modified_at": "2025-01-13T18:12:05.141178+00:00", "name": "Ramos Garcia_2024-2.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos Garcia_2024-2.pdf", "relative_path": "pdf/Ramos Garcia_2024-2.pdf", "size_bytes": 104615}
-{"extension": ".pdf", "hash": "104e7a88a2d515e7dbd3593e2fea5f69f1bb21fb031899d6591cbc98ef5eb203", "modified_at": "2023-03-15T21:13:48+00:00", "name": "¿Quién es Katie Bouman.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/¿Quién es Katie Bouman.pdf", "relative_path": "pdf/¿Quién es Katie Bouman.pdf", "size_bytes": 4922511}
-{"extension": ".pdf", "hash": "83cbbc42252061b3507efb064bdfa0756aba98eca901faf6fc79fb872f3b9fc8", "modified_at": "2025-07-01T20:10:49.625552+00:00", "name": "3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "relative_path": "pdf/3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "size_bytes": 365376}
-{"extension": ".pdf", "hash": "56ff3dbca7ea85543de1d5952d688ac444a9699e2577e9c8eeef381bd73c2f10", "modified_at": "2023-06-15T06:01:40+00:00", "name": "xddd.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/xddd.pdf", "relative_path": "pdf/xddd.pdf", "size_bytes": 1174265}
-{"extension": ".pdf", "hash": "6ff9b255080999dd97119c7cc843c39eda223641658c7810e48716d9b54a8330", "modified_at": "2023-03-30T01:48:51+00:00", "name": "Solucion_Tarea_02_PROBABILIDAD.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_02_PROBABILIDAD.pdf", "relative_path": "pdf/Solucion_Tarea_02_PROBABILIDAD.pdf", "size_bytes": 9606988}
-{"extension": ".pdf", "hash": "4d1a0f792fecefcf225eeb6a757262f18324bd78176c2c235b3b5cc9e8f4c7dc", "modified_at": "2024-12-11T22:17:33.396528+00:00", "name": "Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "relative_path": "pdf/Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "size_bytes": 638244}
-{"extension": ".pdf", "hash": "f5d3b66f39b624e8eff958657c9634a31cf549af312f64c849a8f4e24446d9fd", "modified_at": "2024-07-10T18:40:56+00:00", "name": "moise2006.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/moise2006.pdf", "relative_path": "pdf/moise2006.pdf", "size_bytes": 575132}
-{"extension": ".pdf", "hash": "3ccfd01ee14d002ee1d5300bd967f2799bd207bbc9b8312309810475d6bb706d", "modified_at": "2023-05-10T17:11:52+00:00", "name": "rosenblatt-1957-Perceptron.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/rosenblatt-1957-Perceptron.pdf", "relative_path": "pdf/rosenblatt-1957-Perceptron.pdf", "size_bytes": 4143406}
-{"extension": ".pdf", "hash": "2e4b5fd4d375ca876100e060b8ce7157ae2f6f36aff32ba34c5c35464ba063a8", "modified_at": "2023-02-10T22:00:41+00:00", "name": "voucherConFoto.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/voucherConFoto.pdf", "relative_path": "pdf/voucherConFoto.pdf", "size_bytes": 154820}
-{"extension": ".pdf", "hash": "4a46fa45bef8afcaa0f7cc8849727395bc080f89bab8cf3a6f63efdfa68b29d8", "modified_at": "2022-12-06T13:48:00+00:00", "name": "Turing.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Turing.pdf", "relative_path": "pdf/Turing.pdf", "size_bytes": 4085746}
-{"extension": ".pdf", "hash": "5e422213ee57d0939f2357914a8a84b9335fdfe6df70ba6ab4f394d8fb99a7bb", "modified_at": "2024-06-13T23:22:33+00:00", "name": "Tesis_James (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James (1).pdf", "relative_path": "pdf/Tesis_James (1).pdf", "size_bytes": 864068}
-{"extension": ".pdf", "hash": "6ed25d2c26dbe6f998e02fbd834b7149f924ae20ed4dfa8848c3ae52b56fdb49", "modified_at": "2022-11-22T19:35:13+00:00", "name": "xdd.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/xdd.pdf", "relative_path": "pdf/xdd.pdf", "size_bytes": 1555399}
-{"extension": ".pdf", "hash": "a012159af64e1e657bb73c5f8ec9a616adc3c7639bda562e9732dc123da3ad4d", "modified_at": "2022-08-16T22:42:07+00:00", "name": "Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "relative_path": "pdf/Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "size_bytes": 8729085}
-{"extension": ".pdf", "hash": "4656428199891fae89d565afe00692c2e9a9be4f590baa93138ba0980f7f347c", "modified_at": "2023-02-10T23:29:01+00:00", "name": "Reinscripcion_2020.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Reinscripcion_2020.pdf", "relative_path": "pdf/Reinscripcion_2020.pdf", "size_bytes": 321527}
-{"extension": ".pdf", "hash": "1550c496323fe43b546bdc0e67a3770e1aa84ae85df21bf8a5638c484534593a", "modified_at": "2024-06-13T23:06:16+00:00", "name": "LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "relative_path": "pdf/LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "size_bytes": 536973}
-{"extension": ".pdf", "hash": "563e6c1641ed2ce6e62972633979900d5f6b588f016cec6d63a3948ce841456f", "modified_at": "2024-06-14T21:34:48+00:00", "name": "VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "relative_path": "pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "size_bytes": 371777}
-{"extension": ".pdf", "hash": "838910745c0c7d717215983c696be12ab8b1581dc3c652882459f0e585e0ee34", "modified_at": "2023-02-10T23:31:16+00:00", "name": "Reinscripcion2023.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Reinscripcion2023.pdf", "relative_path": "pdf/Reinscripcion2023.pdf", "size_bytes": 341525}
-{"extension": ".pdf", "hash": "38bac1b24deb267350ac287a907e39b36472fe1e35e6a9927591b86da3e57d66", "modified_at": "2023-02-10T21:54:34+00:00", "name": "voucher.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/voucher.pdf", "relative_path": "pdf/voucher.pdf", "size_bytes": 85879}
-{"extension": ".pdf", "hash": "41234164c5a65e8d09f365608ab0a0f15d4db56e7a8bfc6ab2b312749032433d", "modified_at": "2024-05-24T01:50:37+00:00", "name": "Tesis_James.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James.pdf", "relative_path": "pdf/Tesis_James.pdf", "size_bytes": 813259}
-{"extension": ".pdf", "hash": "cf1c68e2814b40a8395d206864f4c10f87ec128457908c3ca702cf91fbd8d4b3", "modified_at": "2023-03-01T19:13:30+00:00", "name": "Presentacion_Modelacion_Matematica.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Presentacion_Modelacion_Matematica.pdf", "relative_path": "pdf/Presentacion_Modelacion_Matematica.pdf", "size_bytes": 2371938}
-{"extension": ".png", "hash": "215875830a93fc972e0ddafd5fe1f03c6ed2ece7ae00264f6a0509ba8d295845", "modified_at": "2026-02-27T04:02:45.980549+00:00", "name": "Captura de pantalla 2026-02-26 220245.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2026-02-26 220245.png", "relative_path": "png/Captura de pantalla 2026-02-26 220245.png", "size_bytes": 166913}
-{"extension": ".png", "hash": "29dc50e5e290f2359a3e01f2029f7e28c33fda2af03be9194a56436a22d7494b", "modified_at": "2025-01-11T05:38:11.239578+00:00", "name": "Captura de pantalla 2025-01-10 233810.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 233810.png", "relative_path": "png/Captura de pantalla 2025-01-10 233810.png", "size_bytes": 723570}
-{"extension": ".png", "hash": "aed0a10c33783dd6e30d0c6b03d1da0afb9dab87fccb8be1c746086f2cc5ffee", "modified_at": "2025-01-11T05:52:07.085249+00:00", "name": "Captura de pantalla 2025-01-10 235206.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 235206.png", "relative_path": "png/Captura de pantalla 2025-01-10 235206.png", "size_bytes": 649862}
-{"extension": ".png", "hash": "779087d80fd9a3de643ed034a20400a2fb81eef6357efbf0372b87ce8c45c416", "modified_at": "2026-02-27T03:54:55.529258+00:00", "name": "Captura de pantalla 2026-02-26 215454.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2026-02-26 215454.png", "relative_path": "png/Captura de pantalla 2026-02-26 215454.png", "size_bytes": 73297}
-{"extension": ".png", "hash": "ee766222fcbcf51424b560c3811f29f242d8b99312ad77f3a917182131c4e0c3", "modified_at": "2025-01-11T05:38:25.460779+00:00", "name": "Captura de pantalla 2025-01-10 233825.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 233825.png", "relative_path": "png/Captura de pantalla 2025-01-10 233825.png", "size_bytes": 565764}
-{"extension": ".mp4", "hash": "3020bfb97d7deaa13106a0268e15c7ad886a5e4d46cf46f9bf0d39b69120e474", "modified_at": "2023-06-12T16:40:19+00:00", "name": "2023-06-11_004147486.mp4", "path": "/mnt/hdd_0/backups_sin_limpiar/media/2023-06-11_004147486.mp4", "relative_path": "media/2023-06-11_004147486.mp4", "size_bytes": 13289625}
-{"extension": ".mkv", "hash": "6518fd92831a532fedef01f76013e36705316509a0fcbc4d21b9829d2d7f2a3b", "modified_at": "2026-04-01T21:05:00.519132+00:00", "name": "Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "size_bytes": 805372107}
-{"extension": ".mkv", "hash": "e2e082f218566ae1c4f6b79975d3c9e6b8788c51aac6c25d1801960b6c2da0d6", "modified_at": "2026-04-01T21:04:37.713197+00:00", "name": "Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "size_bytes": 630658180}
-{"extension": ".mkv", "hash": "1fa0e2e3df3dac5eba2205cc3f63b2452fb58d37daba8eb9a94791daadcb4bfd", "modified_at": "2026-04-01T21:04:57.621549+00:00", "name": "Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "size_bytes": 1079321865}
-{"extension": ".mkv", "hash": "0d1ff273dae0fbf939f38d1d5bcad08808169c637acb69cbf783fcefeb3ffaa5", "modified_at": "2026-04-01T21:03:40.174640+00:00", "name": "Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "size_bytes": 681980615}
-{"extension": ".mkv", "hash": "0ff72a18877c507dd6f5ff1bfd8cfff99129f18307c5326cf046c900cddd5100", "modified_at": "2026-04-01T21:02:23.747109+00:00", "name": "Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "size_bytes": 671530031}
-{"extension": ".mkv", "hash": "9bd95546f54f7d7bca53398db115dc5fd77b6e6a878106970f8510851e821f91", "modified_at": "2026-04-01T21:04:07.757952+00:00", "name": "Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "size_bytes": 698401851}
-{"extension": ".mkv", "hash": "67dbf53115bfa05d6dec7840ddb1533af9f170bd9a0e69b142e1bf56fc2f66ad", "modified_at": "2026-04-01T21:04:34.557230+00:00", "name": "Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "size_bytes": 563367115}
-{"extension": ".mkv", "hash": "5fbccb1556c76efae429de0b4cf9525112a78d9885544a2a975e1a093103e987", "modified_at": "2026-04-01T21:04:45.890596+00:00", "name": "Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "size_bytes": 675011522}
-{"extension": ".mkv", "hash": "9411a7943bdc8819d1aae28550e4f251a378989161add4a04ef12713b8c0575b", "modified_at": "2026-04-01T21:04:43.604376+00:00", "name": "Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "size_bytes": 863966548}
-{"extension": ".mkv", "hash": "b01b4b92273277582886c4e0c7028eb89ddf4105e9dd07f601be377c3d70747a", "modified_at": "2026-04-01T21:04:40.992192+00:00", "name": "Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "size_bytes": 659671219}
-{"extension": ".mkv", "hash": "252e6bf7ab360007aca544fe67564fc3ce3562b87a845552d6381231a5ea64f0", "modified_at": "2026-04-01T21:04:30.949941+00:00", "name": "Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "size_bytes": 657271594}
-{"extension": ".mkv", "hash": "21874ff1c68038c78d1ccdd20d38a8949d86542eb79026dc2a5a15bf4a80ff00", "modified_at": "2026-04-01T21:04:55.496749+00:00", "name": "Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "size_bytes": 593098156}
-{"extension": ".mkv", "hash": "2e60e40da88609aaaec6c32d002af6c1f0bf6aa91e8aeb45f36e5e201cd78f82", "modified_at": "2026-04-01T21:02:04.884562+00:00", "name": "Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "size_bytes": 703291613}
-{"extension": ".mkv", "hash": "d01e406bb85fcce61b6c87bc8e3b03849215a05d813d3161c9296dc21f0e1a08", "modified_at": "2026-04-01T21:04:58.636739+00:00", "name": "Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "size_bytes": 641682059}
-{"extension": ".mkv", "hash": "ec11473db53d9cb9b92f9f2eeda24e5c3f24790b56ed812784bdff7f3d32f0ef", "modified_at": "2026-04-01T21:03:58.047536+00:00", "name": "Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "size_bytes": 673339332}
-{"extension": ".mkv", "hash": "858243c8d4d6c42e36f90e0b644fa66fa4b330ffdcbd07bb020efb44679b3fec", "modified_at": "2026-04-01T21:04:42.372159+00:00", "name": "Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "size_bytes": 689837834}
-{"extension": ".mkv", "hash": "5a691f7af861547ed5857c3d8ebadc15482d7edbaa4951fe96adf75e4493b3b3", "modified_at": "2026-04-01T20:59:51.643478+00:00", "name": "Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "size_bytes": 637595193}
-{"extension": ".mkv", "hash": "35465646ea248fc82e31e01ed764041f19d62a36bddbad31e8aee25ed39ddc08", "modified_at": "2026-04-01T21:04:07.066003+00:00", "name": "Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "size_bytes": 443796191}
-{"extension": ".mkv", "hash": "74a29b9fab41ded0bd884d270a48c86a83f789d3d731f1191de34c0d1b5cf417", "modified_at": "2026-04-01T21:04:44.804938+00:00", "name": "Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "size_bytes": 664600162}
-{"extension": ".mkv", "hash": "442c18ef743aaf10eea59de9cbeedba9fb69dcbfddb35bd843eee8788e607125", "modified_at": "2026-04-01T21:04:15.626374+00:00", "name": "Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "size_bytes": 662477115}
-{"extension": ".mkv", "hash": "10ca76d3c5380eeceedf37fc6b87da0be5fd4ae3642eb41c38f66c59e059336d", "modified_at": "2026-04-01T21:03:30.722958+00:00", "name": "Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "size_bytes": 583765571}
-{"extension": ".mkv", "hash": "caec9a89f7dcf27837c1c6494eec9d3daeff9b06df811cbce66c00155f473140", "modified_at": "2026-04-01T21:03:52.281950+00:00", "name": "Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "size_bytes": 647739961}
-{"extension": ".mkv", "hash": "78676e06325a25ebef31760475129b0bae3a664be05f91e8ece31dc7b6d8752f", "modified_at": "2026-04-01T21:03:50.194258+00:00", "name": "Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "size_bytes": 580671746}
-{"extension": ".mkv", "hash": "ff3d8ec8ed0c3af316cace6f6cd7efab43ab0dd7641c37c217888e8b416bf2fa", "modified_at": "2026-04-01T21:03:59.057296+00:00", "name": "Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "size_bytes": 618219804}
-{"extension": ".mkv", "hash": "a51121db0dbb652cc92d1ff61c37290fc9fbc61368c6daa60dec876e56f17493", "modified_at": "2026-04-01T21:04:33.392429+00:00", "name": "Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "size_bytes": 568751064}
-
-
-
-================================================
-FILE: hash_queues/backup_limpio-20260708T233057Z.jsonl.status.json
-================================================
+==================================================
+FILE: discos_registrados.json
+==================================================
 {
-  "status": "running",
-  "root": "/mnt/hdd_0/backups_sin_limpiar",
-  "queue_path": "/home/uzr/code/hash_queues/backup_limpio-20260708T233057Z.jsonl",
-  "count": 0,
-  "hash_threads": 12,
-  "chunk_size": 268435456,
-  "started_at": "2026-07-08T23:30:58.019112+00:00",
-  "updated_at": "2026-07-08T23:30:58.019183+00:00"
+  "disk-010f4f09b7569052": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "5359-6848",
+    "id": "disk-010f4f09b7569052",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "5306dc8c",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "5306dc8c-01",
+    "particiones_uuid": [
+      "fsuuid:5359-6848",
+      "partuuid:5306dc8c-01"
+    ],
+    "primer_registro": "2026-09-12T04:25:35.390258+00:00",
+    "serial": "Kingston_DataTraveler_3.0_408D5CBECBBDE7C1391613B5-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "5306dc8c",
+    "ultima_vez_visto": "2026-09-12T07:28:30.192777+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-0d95c27dbd87f2c3": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "2F16-608A",
+    "id": "disk-0d95c27dbd87f2c3",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "7d171feb-6159-4c8c-889c-a61eaf31cbb5",
+    "label": "TAILS",
+    "modelo": "ProductCode",
+    "mountpoint": "/media/uzr/TAILS",
+    "nombre": "VendorCo ProductCode",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "96f2e80e-3eda-4e7d-b18a-3ea849a19802",
+    "particiones_uuid": [
+      "fsuuid:2F16-608A",
+      "partuuid:96f2e80e-3eda-4e7d-b18a-3ea849a19802"
+    ],
+    "primer_registro": "2026-09-12T05:33:14.083179+00:00",
+    "serial": "VendorCo_ProductCode_3781511237152101326-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "7d171feb-6159-4c8c-889c-a61eaf31cbb5",
+    "ultima_vez_visto": "2026-09-12T07:27:14.905101+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "VendorCo"
+  },
+  "disk-18014b380bccab90": {
+    "bus": "usb",
+    "device_node": "/dev/sdc",
+    "filesystem": "vfat",
+    "filesystem_uuid": "87D3-D3E4",
+    "id": "disk-18014b380bccab90",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "00cbdc4b",
+    "modelo": "ProductCode",
+    "mountpoint": "/media/uzr/87D3-D3E4",
+    "nombre": "VendorCo ProductCode",
+    "particion": "/dev/sdc1",
+    "particion_uuid": "00cbdc4b-01",
+    "particiones_uuid": [
+      "fsuuid:87D3-D3E4",
+      "partuuid:00cbdc4b-01"
+    ],
+    "primer_registro": "2026-09-12T05:28:22.855319+00:00",
+    "serial": "VendorCo_ProductCode_9207067123122107640-0:0",
+    "sys_name": "sdc",
+    "tabla_particiones_uuid": "00cbdc4b",
+    "ultima_vez_visto": "2026-09-12T07:28:30.002093+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "VendorCo"
+  },
+  "disk-19d3fec8b39ac0bd": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "A690-20D2",
+    "id": "disk-19d3fec8b39ac0bd",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
+    "label": "TAILS",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/TAILS",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "34bf027a-8001-4b93-8243-1f9d3dce7de7",
+    "particiones_uuid": [
+      "fsuuid:A690-20D2",
+      "partuuid:34bf027a-8001-4b93-8243-1f9d3dce7de7"
+    ],
+    "primer_registro": "2026-05-23T06:08:41.937996+00:00",
+    "serial": "Kingston_DataTraveler_3.0_4CEDFB72A4481681F9041E1A-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
+    "ultima_vez_visto": "2026-05-23T17:53:43.698484+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-24d8269ef37273e6": {
+    "bus": "usb",
+    "device_node": "/dev/sdf",
+    "filesystem": "vfat",
+    "filesystem_uuid": "77CD-2E90",
+    "id": "disk-24d8269ef37273e6",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "3b71049d",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdf1",
+    "particion_uuid": "3b71049d-01",
+    "particiones_uuid": [
+      "fsuuid:77CD-2E90",
+      "partuuid:3b71049d-01"
+    ],
+    "primer_registro": "2026-05-23T05:59:04.923423+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55E6B6369F4608929731E-0:0",
+    "sys_name": "sdf",
+    "tabla_particiones_uuid": "3b71049d",
+    "ultima_vez_visto": "2026-05-23T19:44:44.110112+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-344daeff8e20297a": {
+    "bus": "ata",
+    "device_node": "/dev/sdc1",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "C6BCA8A9BCA89589",
+    "id": "disk-344daeff8e20297a",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000039c22f0a85d",
+    "label": "ADATA_HD710_PRO",
+    "modelo": "TOSHIBA_MQ04ABF100",
+    "mountpoint": "/media/uzr/ADATA HD710 PRO",
+    "nombre": "ADATA TOSHIBA MQ04ABF100",
+    "particion": "/dev/sdc2",
+    "particion_uuid": "1851f49f-aee6-4732-9a12-06a11b2f58a4",
+    "particiones_uuid": [
+      "fsuuid:C6BCA8A9BCA89589",
+      "partuuid:1851f49f-aee6-4732-9a12-06a11b2f58a4",
+      "partuuid:991a80d9-e2fd-4e98-b0f0-9c601745c204"
+    ],
+    "primer_registro": "2026-05-23T04:15:51.902740+00:00",
+    "serial": "TOSHIBA_MQ04ABF100_339SP22GT",
+    "sys_name": "sdc1",
+    "tabla_particiones_uuid": "eabfba6b-0181-4035-831f-0b035cacc9e5",
+    "ultima_vez_visto": "2026-05-23T20:58:24.659144+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000039c22f0a85d"
+  },
+  "disk-39c66f3982baad39": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "92FB-7369",
+    "id": "disk-39c66f3982baad39",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "bf2518ad",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/92FB-7369",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "bf2518ad-01",
+    "particiones_uuid": [
+      "fsuuid:92FB-7369",
+      "partuuid:bf2518ad-01"
+    ],
+    "primer_registro": "2026-09-12T07:26:50.582907+00:00",
+    "serial": "Generic_Flash_Disk_9FCEB95B-0:0",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "bf2518ad",
+    "ultima_vez_visto": "2026-09-12T07:27:14.948933+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-470c8fc311389738": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "2801-80A0",
+    "id": "disk-470c8fc311389738",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "3d05a00b",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/2801-80A0",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "3d05a00b-01",
+    "particiones_uuid": [
+      "fsuuid:2801-80A0",
+      "partuuid:3d05a00b-01"
+    ],
+    "primer_registro": "2026-05-23T03:19:34.794411+00:00",
+    "serial": "Generic_Flash_Disk_6EE6846D-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "3d05a00b",
+    "ultima_vez_visto": "2026-05-23T19:59:13.149770+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-4d666dad805f475e": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "exfat",
+    "filesystem_uuid": "A8D0-97D4",
+    "id": "disk-4d666dad805f475e",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "fa2f0801",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sde1",
+    "particion_uuid": "fa2f0801-01",
+    "particiones_uuid": [
+      "fsuuid:A8D0-97D4",
+      "partuuid:fa2f0801-01"
+    ],
+    "primer_registro": "2026-05-23T05:59:08.284379+00:00",
+    "serial": "Kingston_DataTraveler_3.0_40B0767E23B7E48126522AD8-0:0",
+    "sys_name": "sde",
+    "tabla_particiones_uuid": "fa2f0801",
+    "ultima_vez_visto": "2026-05-23T19:43:28.336571+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-5057efcd339363e0": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "vfat",
+    "filesystem_uuid": "3065-C3CF",
+    "id": "disk-5057efcd339363e0",
+    "id_fuente": "serial",
+    "id_valor": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
+    "label": "BLACK",
+    "modelo": "Cruzer_Edge",
+    "mountpoint": "/media/uzr/BLACK",
+    "nombre": "SanDisk Cruzer Edge",
+    "particion": "/dev/sde1",
+    "particiones_uuid": [
+      "fsuuid:3065-C3CF"
+    ],
+    "primer_registro": "2026-05-23T16:41:29.657839+00:00",
+    "serial": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
+    "sys_name": "sde",
+    "ultima_vez_visto": "2026-05-23T19:44:44.072987+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-55b720ed1ad3f715": {
+    "bus": "scsi",
+    "device_node": "/dev/sdd",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "686A12E96A12B3B2",
+    "id": "disk-55b720ed1ad3f715",
+    "id_fuente": "wwn",
+    "id_valor": "0x3e4141593838345a",
+    "label": "Seagate_Expansion_Drive",
+    "modelo": "Expansion",
+    "nombre": "Seagate Expansion",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "e83592ac-01",
+    "particiones_uuid": [
+      "fsuuid:686A12E96A12B3B2",
+      "partuuid:e83592ac-01"
+    ],
+    "primer_registro": "2026-09-12T05:39:54.375341+00:00",
+    "serial": "1NAAY884Z",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "e83592ac",
+    "ultima_vez_visto": "2026-09-12T05:40:22.499027+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Seagate",
+    "wwn": "0x3e4141593838345a"
+  },
+  "disk-56abd2c1ddd7997d": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "1CD1-48FD",
+    "id": "disk-56abd2c1ddd7997d",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "1c7dbc41",
+    "label": "HERRERAMED",
+    "modelo": "STORE_N_GO",
+    "mountpoint": "/media/uzr/HERRERAMED",
+    "nombre": "Verbatim STORE N GO",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "1c7dbc41-01",
+    "particiones_uuid": [
+      "fsuuid:1CD1-48FD",
+      "partuuid:1c7dbc41-01"
+    ],
+    "primer_registro": "2026-05-23T05:57:57.704053+00:00",
+    "serial": "Verbatim_STORE_N_GO_90009438A73A9904-0:0",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "1c7dbc41",
+    "ultima_vez_visto": "2026-05-23T19:44:44.028928+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Verbatim"
+  },
+  "disk-6ce17bf2a5aed44b": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "6653-46B7",
+    "id": "disk-6ce17bf2a5aed44b",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "013853b7",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON1",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "013853b7-01",
+    "particiones_uuid": [
+      "fsuuid:6653-46B7",
+      "partuuid:013853b7-01"
+    ],
+    "primer_registro": "2026-05-23T06:02:04.747452+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55EA573D217309934035F-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "013853b7",
+    "ultima_vez_visto": "2026-05-23T19:44:44.041656+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-7cb607d072fcfdfa": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "D2CC-61EC",
+    "id": "disk-7cb607d072fcfdfa",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "d2244a74",
+    "label": "PORT",
+    "modelo": "USB_DISK_2.0",
+    "mountpoint": "/media/uzr/PORT",
+    "nombre": "\\x20\\x20\\x20\\x20\\x20\\x20\\x20\\x20 USB DISK 2.0",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "d2244a74-01",
+    "particiones_uuid": [
+      "fsuuid:D2CC-61EC",
+      "partuuid:d2244a74-01"
+    ],
+    "primer_registro": "2026-09-12T04:25:34.858156+00:00",
+    "serial": "_USB_DISK_2.0_070D5317F5C68331-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "d2244a74",
+    "ultima_vez_visto": "2026-09-12T07:23:34.070649+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-7ded812abdce0156": {
+    "bus": "usb",
+    "device_node": "/dev/sdc",
+    "filesystem": "vfat",
+    "filesystem_uuid": "C6DB-AA8C",
+    "id": "disk-7ded812abdce0156",
+    "id_fuente": "partition_uuids",
+    "id_valor": "fsuuid:C6DB-AA8C",
+    "label": "GADEA",
+    "modelo": "U3_Cruzer_Micro",
+    "mountpoint": "/media/uzr/GADEA",
+    "nombre": "GADEA",
+    "particion": "/dev/sdc1",
+    "particiones_uuid": [
+      "fsuuid:C6DB-AA8C"
+    ],
+    "primer_registro": "2026-05-23T17:58:10.299299+00:00",
+    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:0",
+    "sys_name": "sdc",
+    "ultima_vez_visto": "2026-05-23T19:49:55.941072+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-943ab5f448337f8c": {
+    "bus": "usb",
+    "device_node": "/dev/sda",
+    "filesystem": "vfat",
+    "filesystem_uuid": "8DE4-CF47",
+    "id": "disk-943ab5f448337f8c",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "8d3db7cf",
+    "label": "USB_DISK",
+    "modelo": "USB_DISK_2.0",
+    "mountpoint": "/media/uzr/USB DISK",
+    "nombre": "\\x20\\x20\\x20\\x20\\x20\\x20\\x20\\x20 USB DISK 2.0",
+    "particion": "/dev/sda1",
+    "particion_uuid": "8d3db7cf-01",
+    "particiones_uuid": [
+      "fsuuid:8DE4-CF47",
+      "partuuid:8d3db7cf-01"
+    ],
+    "primer_registro": "2026-09-12T05:10:39.813508+00:00",
+    "serial": "_USB_DISK_2.0_07181631D885E132-0:0",
+    "sys_name": "sda",
+    "tabla_particiones_uuid": "8d3db7cf",
+    "ultima_vez_visto": "2026-09-12T07:27:14.819516+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-95cf1c27fd544126": {
+    "bus": "usb",
+    "device_node": "/dev/sdf",
+    "filesystem": "vfat",
+    "filesystem_uuid": "622D-846B",
+    "id": "disk-95cf1c27fd544126",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "360862dc",
+    "label": "CT_UMF_23",
+    "modelo": "TransMemory",
+    "mountpoint": "/media/uzr/CT UMF 23",
+    "nombre": "TOSHIBA TransMemory",
+    "particion": "/dev/sdf1",
+    "particion_uuid": "360862dc-01",
+    "particiones_uuid": [
+      "fsuuid:622D-846B",
+      "partuuid:360862dc-01"
+    ],
+    "primer_registro": "2026-05-23T04:15:49.751781+00:00",
+    "serial": "TOSHIBA_TransMemory_E9AA4B29FE1FCD91A3E8BA11-0:0",
+    "sys_name": "sdf",
+    "tabla_particiones_uuid": "360862dc",
+    "ultima_vez_visto": "2026-05-23T19:59:13.087904+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "TOSHIBA"
+  },
+  "disk-99a75b8a7f0dda90": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "vfat",
+    "filesystem_uuid": "BD6A-A610",
+    "id": "disk-99a75b8a7f0dda90",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "bdc28f98",
+    "label": "USB_DISK",
+    "modelo": "USB_DISK_2.0",
+    "mountpoint": "/media/uzr/USB DISK",
+    "nombre": "\\x20\\x20\\x20\\x20\\x20\\x20\\x20\\x20 USB DISK 2.0",
+    "particion": "/dev/sde1",
+    "particion_uuid": "bdc28f98-01",
+    "particiones_uuid": [
+      "fsuuid:BD6A-A610",
+      "partuuid:bdc28f98-01"
+    ],
+    "primer_registro": "2026-05-23T06:03:48.091970+00:00",
+    "serial": "_USB_DISK_2.0_07083872D31B4A95-0:0",
+    "sys_name": "sde",
+    "tabla_particiones_uuid": "bdc28f98",
+    "ultima_vez_visto": "2026-05-23T19:59:13.026848+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-9e4d787bfc4890b9": {
+    "bus": "usb",
+    "device_node": "/dev/sdh",
+    "filesystem": "exfat",
+    "filesystem_uuid": "A2EA-8993",
+    "id": "disk-9e4d787bfc4890b9",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "004439c0",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdh1",
+    "particion_uuid": "004439c0-01",
+    "particiones_uuid": [
+      "fsuuid:A2EA-8993",
+      "partuuid:004439c0-01"
+    ],
+    "primer_registro": "2026-05-23T06:06:38.927414+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55E6C382B168139430176-0:0",
+    "sys_name": "sdh",
+    "tabla_particiones_uuid": "004439c0",
+    "ultima_vez_visto": "2026-05-23T19:59:13.056144+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-9e5d92d2340ab19a": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "0BF5-390D",
+    "id": "disk-9e5d92d2340ab19a",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "00ed04c9",
+    "modelo": "USB_Flash_Drive",
+    "mountpoint": "/media/uzr/0BF5-390D",
+    "nombre": "ADATA USB Flash Drive",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "00ed04c9-01",
+    "particiones_uuid": [
+      "fsuuid:0BF5-390D",
+      "partuuid:00ed04c9-01"
+    ],
+    "primer_registro": "2026-09-12T04:25:34.270560+00:00",
+    "serial": "ADATA_USB_Flash_Drive_93873901-0:0",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "00ed04c9",
+    "ultima_vez_visto": "2026-09-12T07:28:29.913254+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA"
+  },
+  "disk-9f1b0baff7787b9e": {
+    "bus": "usb",
+    "device_node": "/dev/sdc",
+    "filesystem": "vfat",
+    "filesystem_uuid": "01B0-9C2B",
+    "id": "disk-9f1b0baff7787b9e",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "01b09c2b",
+    "modelo": "USB_DISK",
+    "mountpoint": "/media/uzr/01B0-9C2B",
+    "nombre": "SMI USB DISK",
+    "particion": "/dev/sdc1",
+    "particion_uuid": "01b09c2b-01",
+    "particiones_uuid": [
+      "fsuuid:01B0-9C2B",
+      "partuuid:01b09c2b-01"
+    ],
+    "primer_registro": "2026-09-12T05:30:28.005277+00:00",
+    "serial": "SMI_USB_DISK-0:0",
+    "sys_name": "sdc",
+    "tabla_particiones_uuid": "01b09c2b",
+    "ultima_vez_visto": "2026-09-12T07:25:54.669499+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SMI"
+  },
+  "disk-ae418b2282ba7233": {
+    "bus": "usb",
+    "device_node": "/dev/sdc",
+    "filesystem": "vfat",
+    "filesystem_uuid": "BE5B-8A41",
+    "id": "disk-ae418b2282ba7233",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "7f60069c",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/BE5B-8A41",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sdc1",
+    "particion_uuid": "7f60069c-01",
+    "particiones_uuid": [
+      "fsuuid:BE5B-8A41",
+      "partuuid:7f60069c-01"
+    ],
+    "primer_registro": "2026-09-12T05:34:26.606381+00:00",
+    "serial": "Generic_Flash_Disk_550AC624-0:0",
+    "sys_name": "sdc",
+    "tabla_particiones_uuid": "7f60069c",
+    "ultima_vez_visto": "2026-09-12T07:27:14.860086+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-b95a23446c60cfdf": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "1605-112C",
+    "id": "disk-b95a23446c60cfdf",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "028d17d6",
+    "label": "DPE_EVA",
+    "modelo": "USB_Flash_Drive",
+    "mountpoint": "/media/uzr/DPE_EVA",
+    "nombre": "ADATA USB Flash Drive",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "028d17d6-01",
+    "particiones_uuid": [
+      "fsuuid:1605-112C",
+      "partuuid:028d17d6-01"
+    ],
+    "primer_registro": "2026-05-23T06:03:42.834626+00:00",
+    "serial": "ADATA_USB_Flash_Drive_29236003-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "028d17d6",
+    "ultima_vez_visto": "2026-05-23T19:43:28.341776+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA"
+  },
+  "disk-c723181d67f6607b": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "5227-66BA",
+    "id": "disk-c723181d67f6607b",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "c889cfb9",
+    "label": "2020AGUILAR",
+    "modelo": "Ultra",
+    "mountpoint": "/media/uzr/2020AGUILAR",
+    "nombre": "SanDisk Ultra",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "c889cfb9-01",
+    "particiones_uuid": [
+      "fsuuid:5227-66BA",
+      "partuuid:c889cfb9-01"
+    ],
+    "primer_registro": "2026-09-12T05:33:09.138046+00:00",
+    "serial": "SanDisk_Ultra_4C531001540415106261-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "c889cfb9",
+    "ultima_vez_visto": "2026-09-12T07:24:54.632217+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-d029a3d2d5d7da7b": {
+    "bus": "usb",
+    "device_node": "/dev/sda",
+    "filesystem": "vfat",
+    "filesystem_uuid": "D013-A90E",
+    "id": "disk-d029a3d2d5d7da7b",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "0771c33f",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/D013-A90E",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sda1",
+    "particion_uuid": "0771c33f-01",
+    "particiones_uuid": [
+      "fsuuid:D013-A90E",
+      "partuuid:0771c33f-01"
+    ],
+    "primer_registro": "2026-09-12T07:25:32.118428+00:00",
+    "serial": "Generic_Flash_Disk_5094FCF7-0:0",
+    "sys_name": "sda",
+    "tabla_particiones_uuid": "0771c33f",
+    "ultima_vez_visto": "2026-09-12T07:25:54.592750+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-d36044d1c1dd1617": {
+    "bus": "usb",
+    "device_node": "/dev/sda",
+    "filesystem": "vfat",
+    "filesystem_uuid": "6837-6515",
+    "id": "disk-d36044d1c1dd1617",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "03633715",
+    "label": "YOALI",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/YOALI",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sda1",
+    "particion_uuid": "03633715-01",
+    "particiones_uuid": [
+      "fsuuid:6837-6515",
+      "partuuid:03633715-01"
+    ],
+    "primer_registro": "2026-09-12T04:25:34.471260+00:00",
+    "serial": "Kingston_DataTraveler_3.0_D067E516494B1611660D558E-0:0",
+    "sys_name": "sda",
+    "tabla_particiones_uuid": "03633715",
+    "ultima_vez_visto": "2026-09-12T07:23:36.381592+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-db31b958c725e9e4": {
+    "bus": "usb",
+    "device_node": "/dev/sr0",
+    "id": "disk-db31b958c725e9e4",
+    "id_fuente": "serial",
+    "id_valor": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
+    "modelo": "U3_Cruzer_Micro",
+    "nombre": "SanDisk U3 Cruzer Micro",
+    "primer_registro": "2026-05-23T17:58:19.025321+00:00",
+    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
+    "sys_name": "sr0",
+    "ultima_vez_visto": "2026-05-23T19:43:28.462422+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-db3f0d67ba566616": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "EE2B-50C8",
+    "id": "disk-db3f0d67ba566616",
+    "id_fuente": "partition_uuids",
+    "id_valor": "fsuuid:EE2B-50C8",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_2.0",
+    "mountpoint": "/media/uzr/KINGSTON1",
+    "nombre": "KINGSTON",
+    "particion": "/dev/sdd1",
+    "particiones_uuid": [
+      "fsuuid:EE2B-50C8"
+    ],
+    "primer_registro": "2026-05-23T06:01:07.155098+00:00",
+    "serial": "Kingston_DataTraveler_2.0_5B7B1A00005C-0:0",
+    "sys_name": "sdd",
+    "ultima_vez_visto": "2026-05-23T19:43:28.383918+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-dc9d10b9b2739f2f": {
+    "bus": "ata",
+    "device_node": "/dev/sdb1",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "C21A36381A362A35",
+    "id": "disk-dc9d10b9b2739f2f",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000039c9b30371a",
+    "label": "MARTHA_DOLI_(INFO_RECIENTE)",
+    "modelo": "TOSHIBA_MQ04ABF100",
+    "mountpoint": "/media/uzr/MARTHA DOLI (INFO RECIENTE)",
+    "nombre": "ADATA TOSHIBA MQ04ABF100",
+    "particion": "/dev/sdb2",
+    "particion_uuid": "663f33be-da0e-4468-9fe4-f43a54307855",
+    "particiones_uuid": [
+      "fsuuid:C21A36381A362A35",
+      "partuuid:663f33be-da0e-4468-9fe4-f43a54307855",
+      "partuuid:c992c99d-1fb8-4f25-b8d7-bbd5b88ceeb0"
+    ],
+    "primer_registro": "2026-05-23T04:15:58.051456+00:00",
+    "serial": "TOSHIBA_MQ04ABF100_X3JSP3E0T",
+    "sys_name": "sdb1",
+    "tabla_particiones_uuid": "9906a8aa-df31-43a8-b9c4-bcf79588f640",
+    "ultima_vez_visto": "2026-05-26T17:09:26.939388+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000039c9b30371a"
+  },
+  "disk-dffbf5186e6e3b33": {
+    "bus": "usb",
+    "device_node": "/dev/sda",
+    "filesystem": "vfat",
+    "filesystem_uuid": "F4B2-CA98",
+    "id": "disk-dffbf5186e6e3b33",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "533b6211",
+    "modelo": "ProductCode",
+    "mountpoint": "/media/uzr/F4B2-CA98",
+    "nombre": "VendorCo ProductCode",
+    "particion": "/dev/sda1",
+    "particion_uuid": "533b6211-01",
+    "particiones_uuid": [
+      "fsuuid:F4B2-CA98",
+      "partuuid:533b6211-01"
+    ],
+    "primer_registro": "2026-09-12T05:10:34.027610+00:00",
+    "serial": "VendorCo_ProductCode_7159771137857234124-0:0",
+    "sys_name": "sda",
+    "tabla_particiones_uuid": "533b6211",
+    "ultima_vez_visto": "2026-09-12T07:28:29.950795+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "VendorCo"
+  },
+  "disk-e170ff5d93b39289": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "4C1C-3291",
+    "id": "disk-e170ff5d93b39289",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "c3072e18",
+    "label": "PILYBEL",
+    "modelo": "USB_DISK",
+    "mountpoint": "/media/uzr/PILYBEL",
+    "nombre": "SMI USB DISK",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "c3072e18-01",
+    "particiones_uuid": [
+      "fsuuid:4C1C-3291",
+      "partuuid:c3072e18-01"
+    ],
+    "primer_registro": "2026-05-23T03:20:47.859111+00:00",
+    "serial": "SMI_USB_DISK_AA00000000033960-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "c3072e18",
+    "ultima_vez_visto": "2026-09-12T07:25:54.633104+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SMI"
+  },
+  "disk-e211de15d83bb0ba": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "E4EB-6DBF",
+    "id": "disk-e211de15d83bb0ba",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "29e33bb4",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/E4EB-6DBF",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "29e33bb4-01",
+    "particiones_uuid": [
+      "fsuuid:E4EB-6DBF",
+      "partuuid:29e33bb4-01"
+    ],
+    "primer_registro": "2026-09-12T05:28:18.828543+00:00",
+    "serial": "Generic_Flash_Disk_DEB7C06F-0:0",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "29e33bb4",
+    "ultima_vez_visto": "2026-09-12T05:30:00.496700+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-e3b4f365b74cbe9e": {
+    "bus": "scsi",
+    "device_node": "/dev/sdc",
+    "id": "disk-e3b4f365b74cbe9e",
+    "id_fuente": "weak_hardware_fallback",
+    "id_valor": "scsi",
+    "nombre": "/dev/sdc",
+    "primer_registro": "2026-05-23T04:15:57.524025+00:00",
+    "sys_name": "sdc",
+    "ultima_vez_visto": "2026-09-12T07:25:54.681257+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-e6e2accb7d027956": {
+    "bus": "scsi",
+    "device_node": "/dev/sda3",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "58ACC9AFACC98848",
+    "id": "disk-e6e2accb7d027956",
+    "id_fuente": "wwn",
+    "id_valor": "0x3043208463202400",
+    "label": "Reservado_para_el_sistema",
+    "modelo": "XPG_EX500",
+    "mountpoint": "/media/uzr/58ACC9AFACC98848",
+    "nombre": "ADATA XPG EX500",
+    "particion": "/dev/sda2",
+    "particion_uuid": "571a8e1c-02",
+    "particiones_uuid": [
+      "fsuuid:58ACC9AFACC98848",
+      "fsuuid:AC98C6FB98C6C2D6",
+      "fsuuid:BC1A50891A504316",
+      "partuuid:571a8e1c-01",
+      "partuuid:571a8e1c-02",
+      "partuuid:571a8e1c-03"
+    ],
+    "primer_registro": "2026-05-23T04:16:03.555766+00:00",
+    "serial": "1ADATA_XPG_EX500_4320846C20B4",
+    "sys_name": "sda3",
+    "tabla_particiones_uuid": "571a8e1c",
+    "ultima_vez_visto": "2026-05-26T17:09:27.209987+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x3043208463202400"
+  },
+  "disk-f4a2a59b894b550c": {
+    "bus": "scsi",
+    "device_node": "/dev/sda",
+    "id": "disk-f4a2a59b894b550c",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000000000000001",
+    "modelo": "ED600",
+    "nombre": "ADATA ED600",
+    "primer_registro": "2026-05-26T05:48:19.172826+00:00",
+    "serial": "35000000000000001",
+    "sys_name": "sda",
+    "ultima_vez_visto": "2026-05-26T05:49:25.897890+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000000000000001"
+  }
 }
-
-
-================================================
-FILE: hash_queues/disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl.status.json
-================================================
-{
-  "status": "done",
-  "root": "/media/uzr/MARTHA DOLI (INFO RECIENTE)",
-  "queue_path": "/home/uzr/code/hash_queues/disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl",
-  "count": 731707,
-  "hash_threads": 7,
-  "chunk_size": 268435456,
-  "started_at": "2026-05-26T14:20:32.742131+00:00",
-  "updated_at": "2026-05-26T16:55:49.231977+00:00"
-}
-
-
-================================================
-FILE: hash_queues/disk_e6e2accb7d027956-20260526T142033Z.jsonl.status.json
-================================================
-{
-  "status": "done",
-  "root": "/media/uzr/58ACC9AFACC98848",
-  "queue_path": "/home/uzr/code/hash_queues/disk_e6e2accb7d027956-20260526T142033Z.jsonl",
-  "count": 78014,
-  "hash_threads": 7,
-  "chunk_size": 268435456,
-  "started_at": "2026-05-26T14:20:33.265235+00:00",
-  "updated_at": "2026-05-26T15:08:06.843502+00:00"
-}
-
