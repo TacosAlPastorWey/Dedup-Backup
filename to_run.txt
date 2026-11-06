@@ -1,0 +1,2 @@
+/home/uzr/v_envs/Scrapper/bin/python3 /home/uzr/code/listener_2.py --db-dsn 'dbname=scrapper' --output-root /home/uzr/data_full
+/home/uzr/v_envs/Scrapper/bin/python /home/uzr/code/menu.py

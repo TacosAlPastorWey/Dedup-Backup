@@ -1,0 +1,54 @@
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Configuration with sensitive data
+backup_profiles.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Log files
+*.log
+disk_listener.log
+disk_listener_logs/
+
+# Hash queues (generated)
+hash_queues/
+
+# Generated queue files
+*.jsonl
+*.jsonl.status.json
+*.status.json.tmp
+
+# Temporary files
+*.tmp
+*.part
+*.swp
+*.swo
+*~
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage/Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/

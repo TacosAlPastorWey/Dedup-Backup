@@ -1,0 +1,14 @@
+# para copiar todo lo del nvme al hdd
+sudo rsync -aH --info=progress2 --human-readable \
+  /home/uzr/data_full/ \
+  /mnt/backup_resistencia/FULL/
+# Verificacion
+sudo rsync -aHn \
+  /home/uzr/data_full/ \
+  /mnt/backup_resistencia/FULL/
+
+# Limpiez con enlaces simbolicos incluidos
+sudo find /home/uzr/data_full -type f -o -type l
+# limpieza 2 sudo find /home/uzr/data_full -type f -delete
+
+

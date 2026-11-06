@@ -1,0 +1,3289 @@
+Directory structure:
+└── code/
+    ├── README.md
+    ├── backup_profiles.json
+    ├── consulter_copier.py
+    ├── discos_registrados.json
+    ├── explorer_hasher.py
+    ├── listener.py
+    ├── menu.py
+    ├── run_usb_copy.sh
+    ├── to_run.txt
+    └── hash_queues/
+        ├── backup_limpio-20260708T233057Z.jsonl
+        ├── backup_limpio-20260708T233057Z.jsonl.status.json
+        ├── disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl.status.json
+        └── disk_e6e2accb7d027956-20260526T142033Z.jsonl.status.json
+
+================================================
+FILE: README.md
+================================================
+# Dedup Backup
+
+Dedup Backup es una herramienta para automatizar respaldos mediante deduplicación basada en contenido. Utiliza el algoritmo **BLAKE3** para identificar archivos de forma única y almacena la información en una base de datos **PostgreSQL**, evitando copiar archivos cuyo contenido ya existe.
+
+El proyecto está diseñado para trabajar con grandes volúmenes de datos distribuidos en múltiples discos, priorizando el rendimiento mediante procesamiento paralelo y una arquitectura desacoplada entre exploración, hashing, consulta a la base de datos y copiado.
+
+## Características
+
+* Deduplicación basada en el hash **BLAKE3**.
+* Base de datos **PostgreSQL** para el registro de hashes y metadatos.
+* Copia únicamente de archivos cuyo contenido no existe previamente.
+* Procesamiento paralelo para aprovechar procesadores multinúcleo.
+* Ejecución simultánea de múltiples lectores, uno por cada disco o fuente de datos.
+* Número configurable de *workers* para el cálculo de hashes.
+* Procesamiento por lotes (*batches*) para reducir el número de consultas a la base de datos y mejorar el rendimiento.
+* Sistema de perfiles para diferentes configuraciones de respaldo.
+* Registro de eventos mediante archivos de log.
+* Sistema de colas para desacoplar las distintas etapas del procesamiento.
+
+## Arquitectura
+
+El sistema está compuesto por un proceso principal y uno o varios de procesamiento, permitiendo automatizar completamente la ingesta y deduplicación de dispositivos de almacenamiento.
+
+### 1. Proceso principal
+
+El proceso principal permanece en ejecución esperando nuevas fuentes de datos. Estas pueden provenir de dos formas:
+
+* Conexión automática de un dispositivo de almacenamiento, como memorias USB, discos duros externos, SSD externos o tarjetas SD.
+* Ejecución manual desde el menú, seleccionando una carpeta o un disco específico.
+
+Cuando se detecta un nuevo dispositivo, el proceso espera a que el sistema operativo complete su montaje. Una vez que el volumen está disponible y es accesible, inicia automáticamente el procesamiento correspondiente utilizando el perfil configurado, donde el perfil es una base de datos y un path donde se almacenarán los resultados.
+
+### 2. Exploración del sistema de archivos
+
+El proceso de exploración recorre recursivamente todos los directorios de la fuente de datos.
+
+Para evitar trabajo innecesario, únicamente procesa archivos cuyas extensiones pertenecen a un conjunto inmutable (*frozen set*) de extensiones permitidas. Este mecanismo permite realizar búsquedas muy rápidas y filtrar inmediatamente archivos que no forman parte del respaldo.
+
+Cada archivo válido es enviado al proceso de hashing.
+
+### 3. Hashing paralelo
+
+El cálculo de hashes se realiza utilizando un conjunto configurable de *workers*.
+
+Cada *worker* procesa archivos de forma independiente calculando su hash mediante el algoritmo **BLAKE3**, aprovechando múltiples núcleos del procesador para maximizar el rendimiento.
+
+El número de *workers* puede configurarse para cada lector según el hardware disponible.
+
+### 4. Procesamiento por lotes
+
+Los hashes calculados no se consultan individualmente.
+
+Se agrupan en lotes (*batches*) de tamaño configurable y posteriormente se realizan consultas masivas sobre PostgreSQL para determinar cuáles archivos ya existen dentro de la base de datos.
+
+Este enfoque reduce considerablemente el número de consultas y mejora el rendimiento cuando se procesan cientos de miles o millones de archivos.
+
+### 5. Copiado y registro
+
+Para cada lote procesado:
+
+* Los archivos cuyo hash ya existe en PostgreSQL son descartados.
+* Los archivos nuevos son asignados como pendientes durante el copiado al directorio definido por el perfil activo.
+* Una vez copiados correctamente, se registran como finalizados en PostgreSQL junto con su hash BLAKE3 y sus metadatos.
+
+De esta forma se garantiza que un mismo contenido nunca sea almacenado dos veces, independientemente de su nombre o ubicación original.
+
+## Paralelismo
+
+La arquitectura permite ejecutar múltiples lectores de manera simultánea.
+
+Cada lector puede trabajar sobre una fuente distinta (por ejemplo, un disco externo diferente) y configurarse de manera independiente con:
+
+* Número de *workers* para el cálculo de hashes.
+* Tamaño de los lotes (*batch size*).
+* Directorio de destino.
+* Perfil de respaldo.
+* Base de datos PostgreSQL.
+
+Esto permite aprovechar varios dispositivos de almacenamiento al mismo tiempo, distribuyendo la carga entre CPU, memoria y discos para maximizar el rendimiento del proceso de deduplicación.
+
+## Paralelismo
+
+El programa fue diseñado para escalar con el hardware disponible.
+
+Es posible ejecutar múltiples instancias del lector, asignando una a cada disco físico. Cada instancia puede configurarse de manera independiente con:
+
+* Número de *workers* dedicados al cálculo de hashes.
+* Tamaño de los lotes (*batch size*).
+* Base de datos de destino.
+* Directorio de respaldo.
+
+De esta forma es posible aprovechar mejor el ancho de banda de múltiples discos, distribuir la carga entre diferentes dispositivos de almacenamiento y ajustar el consumo de CPU según el equipo.
+
+## Requisitos
+
+* Linux
+* Python 3.11 o superior
+* PostgreSQL
+* Entorno virtual de Python (recomendado)
+
+## Instalación
+
+```bash
+git clone <URL_DEL_REPOSITORIO>
+cd dedup-backup
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+Configura PostgreSQL y crea la base de datos que almacenará los hashes y metadatos de los archivos.
+
+## Uso
+
+### Iniciar un lector automatizado sobre un unico perfil, plug and play para comenzar un backup
+
+```bash
+/home/uzr/v_envs/Scrapper/bin/python3 ./listener.py \
+    --db-dsn "dbname=scrapper" \
+    --output-root /home/uzr/data_full
+```
+
+Pueden ejecutarse varias instancias del lector simultáneamente para distintos discos.
+
+### Ejecutar el menú principal
+
+```bash
+/home/uzr/v_envs/Scrapper/bin/python ./menu.py
+```
+
+Desde el menú es posible:
+
+* Seleccionar un perfil de respaldo.
+* Elegir la base de datos.
+* Seleccionar el directorio de destino.
+* Escanear una carpeta.
+* Escanear un disco completo.
+* Iniciar el proceso de deduplicación y copia.
+
+## Funcionamiento
+
+Para cada archivo:
+
+1. Se localiza el archivo durante la exploración.
+2. Se calcula su hash BLAKE3.
+3. El hash se agrupa junto con otros en un lote.
+4. PostgreSQL determina qué hashes ya existen.
+5. Solo los archivos nuevos se copian al destino.
+6. Finalmente se registran el hash, la ruta y los metadatos correspondientes.
+
+Este enfoque evita realizar consultas individuales por archivo y reduce significativamente el tiempo total de procesamiento cuando se manejan cientos de miles o millones de archivos.
+
+## Estado del proyecto
+
+El proyecto se encuentra en desarrollo activo. Entre las mejoras planeadas se incluyen:
+
+* Interfaz TUI con Textual.
+* Instalador automático.
+* Archivo de configuración centralizado.
+* Empaquetado como aplicación instalable.
+* API para automatización.
+* Métricas de rendimiento y monitoreo.
+* Pruebas automatizadas.
+* Hashing por ssh con calculo local para solo enviar hashes y hacer rsync
+## Licencia
+
+Pendiente de definir.
+
+# Casos de uso
+Si tienes un montón de carpetas de distintas fuentes y no quieres filtrarlas manualmente.
+Si tienes que crear un backup de archivos para comenzando desde cero.
+
+
+================================================
+FILE: backup_profiles.json
+================================================
+{
+  "active_profile": "personal",
+  "filename_mode": "first_name",
+  "profiles": {
+    "resistencia": {
+      "db_dsn": "dbname=full_backup user=usr_an0ny password=sincesar1 host=localhost port=5432",
+      "copy_root": "/home/uzr/data_full"
+    },
+    "personal": {
+      "db_dsn": "dbname=personal user=uzr",
+      "copy_root": "/home/uzr/data_full_personal"
+    }
+  }
+}
+
+
+================================================
+FILE: consulter_copier.py
+================================================
+import argparse
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+from pathlib import Path
+
+import psycopg2
+
+from explorer_hasher import (
+    DEFAULT_QUEUE_DIR,
+    build_queue_path,
+    count_files,
+    iter_hashed_files,
+    load_hash_queue,
+)
+
+DEFAULT_DB_DSN = os.environ.get("CONSULTER_DB_DSN", "")
+DEFAULT_DESTINATION_ROOT = Path(os.environ.get("CONSULTER_COPY_ROOT", "/home/uzr/data_full"))
+COPY_CHUNK_SIZE = int(os.environ.get("CONSULTER_COPY_CHUNK_MB", "64")) * 1024 * 1024
+DB_RETRIES = int(os.environ.get("CONSULTER_DB_RETRIES", "6"))
+DB_RETRY_SLEEP = float(os.environ.get("CONSULTER_DB_RETRY_SLEEP", "0.75"))
+FILENAME_MODES = {"hash", "first_name"}
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS backup_disks (
+    id BIGSERIAL PRIMARY KEY,
+    label TEXT,
+    mount_path TEXT UNIQUE NOT NULL,
+    total_bytes BIGINT,
+    free_bytes BIGINT,
+    status TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS disks (
+    id BIGSERIAL PRIMARY KEY,
+    serial TEXT UNIQUE,
+    model TEXT,
+    label TEXT,
+    filesystem TEXT,
+    mount_path TEXT,
+    size_bytes BIGINT,
+    status TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_seen TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id BIGSERIAL PRIMARY KEY,
+    disk_id BIGINT REFERENCES disks(id),
+    status TEXT,
+    started_at TIMESTAMP DEFAULT NOW(),
+    finished_at TIMESTAMP,
+    last_copied_hash TEXT,
+    last_copied_path TEXT
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    id BIGSERIAL PRIMARY KEY,
+    hash TEXT UNIQUE NOT NULL,
+    size_bytes BIGINT,
+    status TEXT,
+    name TEXT,
+    extension TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS extension TEXT;
+
+CREATE TABLE IF NOT EXISTS stored_files (
+    id BIGSERIAL PRIMARY KEY,
+    file_id BIGINT REFERENCES files(id),
+    backup_disk_id BIGINT REFERENCES backup_disks(id),
+    relative_path TEXT NOT NULL,
+    verified BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT unique_backup_disk_path UNIQUE (backup_disk_id, relative_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);
+CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_disks_status ON disks(status);
+CREATE INDEX IF NOT EXISTS idx_backup_disks_status ON backup_disks(status);
+CREATE INDEX IF NOT EXISTS idx_stored_files_disk_file ON stored_files(backup_disk_id, file_id);
+"""
+
+RETRYABLE_DB_ERRORS = (
+    psycopg2.errors.DeadlockDetected,
+    psycopg2.errors.SerializationFailure,
+    psycopg2.errors.LockNotAvailable,
+)
+
+
+def connect_db(dsn: str):
+    if not dsn:
+        raise ValueError(
+            "Debe definir la conexión PostgreSQL. Use CONSULTER_DB_DSN o el argumento --db-dsn."
+        )
+    return psycopg2.connect(dsn)
+
+
+def ensure_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute(SCHEMA_SQL)
+    conn.commit()
+
+
+def run_db(conn, action: str, callback):
+    for attempt in range(1, DB_RETRIES + 1):
+        try:
+            result = callback()
+            if not conn.autocommit:
+                conn.commit()
+            return result
+        except RETRYABLE_DB_ERRORS as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt >= DB_RETRIES:
+                raise
+            print(
+                f"Reintentando DB {action} ({attempt}/{DB_RETRIES}) por bloqueo: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(DB_RETRY_SLEEP * attempt)
+
+
+def get_or_create_backup_disk(conn, mount_path, label=None, total_bytes=None, free_bytes=None, status="online"):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backup_disks (mount_path, label, total_bytes, free_bytes, status) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (mount_path) DO UPDATE SET "
+                "label = COALESCE(EXCLUDED.label, backup_disks.label), "
+                "total_bytes = COALESCE(EXCLUDED.total_bytes, backup_disks.total_bytes), "
+                "free_bytes = COALESCE(EXCLUDED.free_bytes, backup_disks.free_bytes), "
+                "status = EXCLUDED.status "
+                "RETURNING id",
+                (mount_path, label, total_bytes, free_bytes, status),
+            )
+            return cur.fetchone()[0]
+
+    return run_db(conn, "backup_disks upsert", query)
+
+
+def get_file_row(conn, hash_value):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, status FROM files WHERE hash = %s", (hash_value,))
+            return cur.fetchone()
+
+    return run_db(conn, "files select", query)
+
+
+def insert_reserved_file(conn, hash_value, file_meta):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO files (hash, size_bytes, status, name, extension) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (hash) DO NOTHING RETURNING id",
+                (
+                    hash_value,
+                    file_meta.get("size_bytes"),
+                    "reserved",
+                    file_meta.get("name"),
+                    file_meta.get("extension"),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    return run_db(conn, "files insert", query)
+
+
+def mark_file_reserved(conn, file_id, file_meta):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE files SET "
+                "status = %s, "
+                "size_bytes = COALESCE(files.size_bytes, %s), "
+                "name = COALESCE(files.name, %s), "
+                "extension = COALESCE(files.extension, %s) "
+                "WHERE id = %s",
+                (
+                    "reserved",
+                    file_meta.get("size_bytes"),
+                    file_meta.get("name"),
+                    file_meta.get("extension"),
+                    file_id,
+                ),
+            )
+
+    run_db(conn, "files reserve", query)
+
+
+def reserve_hash(conn, hash_value, file_meta):
+    row = get_file_row(conn, hash_value)
+    if row:
+        file_id, status = row
+        if status == "copied":
+            return file_id, "copied", False
+        mark_file_reserved(conn, file_id, file_meta)
+        return file_id, "reserved", False
+
+    file_id = insert_reserved_file(conn, hash_value, file_meta)
+    if file_id:
+        return file_id, "reserved", True
+
+    row = get_file_row(conn, hash_value)
+    if not row:
+        raise RuntimeError(f"No se pudo reservar hash {hash_value}")
+
+    file_id, status = row
+    if status == "copied":
+        return file_id, "copied", False
+    mark_file_reserved(conn, file_id, file_meta)
+    return file_id, "reserved", False
+
+
+def update_file_status(conn, file_id, status):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute("UPDATE files SET status = %s WHERE id = %s", (status, file_id))
+
+    run_db(conn, f"files status {status}", query)
+
+
+def ensure_stored_file(conn, file_id, backup_disk_id, relative_path):
+    def query():
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO stored_files (file_id, backup_disk_id, relative_path) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (backup_disk_id, relative_path) DO UPDATE SET "
+                "file_id = EXCLUDED.file_id, verified = FALSE",
+                (file_id, backup_disk_id, relative_path),
+            )
+
+    run_db(conn, "stored_files upsert", query)
+
+
+def sanitize_filename(name: str, fallback: str) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", name.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or fallback
+
+
+def destination_for(destination_root: Path, digest: str, file_meta: dict, filename_mode: str = "hash") -> Path:
+    extension = (file_meta.get("extension") or "").lower()
+    extension_dir = extension.lstrip(".") or "no_ext"
+
+    if filename_mode == "first_name":
+        safe_name = sanitize_filename(file_meta.get("name") or digest, digest)
+        name_path = Path(safe_name)
+        if extension and not name_path.suffix:
+            safe_name = f"{safe_name}{extension}"
+            name_path = Path(safe_name)
+        content_dest = destination_root / extension_dir / safe_name
+        if content_dest.exists():
+            expected_size = file_meta.get("size_bytes")
+            try:
+                same_size = expected_size is None or content_dest.stat().st_size == expected_size
+            except OSError:
+                same_size = False
+            if not same_size:
+                suffix = name_path.suffix or extension
+                stem = name_path.stem or digest
+                content_dest = destination_root / extension_dir / f"{stem}-{digest[:12]}{suffix}"
+        return content_dest
+
+    content_dest = destination_root / extension_dir / digest
+    if extension:
+        content_dest = content_dest.with_suffix(extension)
+    return content_dest
+
+
+def copy_file(source_path: str, destination_path: Path):
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination_path.with_name(f".{destination_path.name}.{os.getpid()}.part")
+    try:
+        with open(source_path, "rb") as source, tmp_path.open("wb") as destination:
+            shutil.copyfileobj(source, destination, length=COPY_CHUNK_SIZE)
+        shutil.copystat(source_path, tmp_path)
+        os.replace(tmp_path, destination_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def print_progress(disk_id: str, current: int, total: int):
+    print(f"PROGRESS:{disk_id}:{current}:{total}", flush=True)
+
+
+def count_queue_records(queue_path: str | Path) -> int:
+    try:
+        with Path(queue_path).open("r", encoding="utf-8") as queue_file:
+            return sum(1 for line in queue_file if line.strip())
+    except FileNotFoundError:
+        return 0
+
+
+def copy_one_file(
+    conn,
+    digest: str,
+    file_meta: dict,
+    backup_disk_id: int,
+    destination_root: Path,
+    summary: dict,
+    filename_mode: str,
+):
+    summary["scanned"] += 1
+    relative_path = file_meta.get("relative_path") or file_meta.get("name") or file_meta.get("path")
+    file_id, status, created = reserve_hash(conn, digest, file_meta)
+
+    if status == "copied":
+        summary["already_registered"] += 1
+        ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+        return
+
+    if created:
+        summary["reserved"] += 1
+    else:
+        summary["retried"] += 1
+
+    content_dest = destination_for(destination_root, digest, file_meta, filename_mode)
+    try:
+        expected_size = file_meta.get("size_bytes")
+        if content_dest.exists() and (expected_size is None or content_dest.stat().st_size == expected_size):
+            update_file_status(conn, file_id, "copied")
+            ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+            summary["copied"] += 1
+            return
+
+        copy_file(file_meta["path"], content_dest)
+        update_file_status(conn, file_id, "copied")
+        ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+        summary["copied"] += 1
+        print(f"Copiado {file_meta['path']} -> {content_dest}", flush=True)
+    except Exception as exc:
+        update_file_status(conn, file_id, "failed")
+        ensure_stored_file(conn, file_id, backup_disk_id, relative_path)
+        summary["failed"] += 1
+        print(f"Error copiando {file_meta.get('path')}: {exc}", file=sys.stderr, flush=True)
+
+
+def copy_files(
+    conn,
+    records,
+    backup_disk_id: int,
+    destination_root: Path,
+    disk_id: str,
+    filename_mode: str = "hash",
+    total_items: int = 0,
+    emit_progress: bool = True,
+):
+    summary = {
+        "scanned": 0,
+        "already_registered": 0,
+        "reserved": 0,
+        "retried": 0,
+        "copied": 0,
+        "failed": 0,
+        "total_items": total_items,
+    }
+    if emit_progress:
+        print_progress(disk_id, 0, total_items)
+
+    progress_step = max(1, total_items // 100) if total_items else 25
+    last_progress = 0
+    for digest, file_meta in records:
+        copy_one_file(conn, digest, file_meta, backup_disk_id, destination_root, summary, filename_mode)
+        if emit_progress and summary["scanned"] - last_progress >= progress_step:
+            print_progress(disk_id, summary["scanned"], total_items)
+            last_progress = summary["scanned"]
+
+    if emit_progress:
+        final_total = total_items or summary["scanned"]
+        print_progress(disk_id, final_total, final_total)
+    return summary
+
+
+def run_consulter(
+    root: str,
+    disk_id: str,
+    destination_root: Path,
+    conn,
+    queue_path: str | Path | None = None,
+    queue_dir: str | Path | None = None,
+    from_queue: bool = False,
+    include_system_dirs: bool = False,
+    filename_mode: str = "hash",
+):
+    if filename_mode not in FILENAME_MODES:
+        raise ValueError(f"filename_mode invalido: {filename_mode}")
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"La ruta de origen no existe o no es directorio: {root}")
+
+    try:
+        stats = os.statvfs(root)
+        total_bytes = stats.f_blocks * stats.f_frsize
+        free_bytes = stats.f_bavail * stats.f_frsize
+    except OSError:
+        total_bytes = None
+        free_bytes = None
+
+    backup_disk_id = get_or_create_backup_disk(
+        conn,
+        str(root),
+        label=disk_id,
+        total_bytes=total_bytes,
+        free_bytes=free_bytes,
+        status="online",
+    )
+
+    active_queue_path = Path(queue_path) if queue_path else build_queue_path(disk_id, queue_dir)
+    if from_queue:
+        if not queue_path:
+            raise ValueError("--from-queue requiere --queue-path")
+        total_items = count_queue_records(active_queue_path)
+        print(f"Leyendo cola de hashes: {active_queue_path}", flush=True)
+        records = load_hash_queue(active_queue_path)
+        emit_copy_progress = True
+    else:
+        print("Contando archivos a explorar...", flush=True)
+        total_items = count_files(root, include_system_dirs=include_system_dirs)
+        print(f"Archivos a explorar: {total_items}", flush=True)
+        print(f"Cola de hashes: {active_queue_path}", flush=True)
+        progress_step = max(1, total_items // 100) if total_items else 1
+        last_progress = {"value": -1}
+
+        def hash_progress(current: int):
+            if total_items <= 0:
+                return
+            if current == total_items or current - last_progress["value"] >= progress_step:
+                print_progress(disk_id, current, total_items)
+                last_progress["value"] = current
+
+        records = iter_hashed_files(
+            root,
+            active_queue_path,
+            include_system_dirs=include_system_dirs,
+            progress_callback=hash_progress,
+        )
+        emit_copy_progress = False
+
+    summary = copy_files(
+        conn,
+        records,
+        backup_disk_id,
+        destination_root,
+        disk_id,
+        filename_mode=filename_mode,
+        total_items=total_items,
+        emit_progress=emit_copy_progress,
+    )
+    if not from_queue and total_items:
+        print_progress(disk_id, total_items, total_items)
+    summary["queue_path"] = str(active_queue_path)
+    return summary
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Consulter Copier: hashea en streaming y copia solo los datos nuevos."
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        help="Ruta montada del disco donde se hara el hashing.",
+    )
+    parser.add_argument(
+        "--disk-id",
+        default=None,
+        help="Identificador del disco que se usa para registrar el escaneo en la base de datos.",
+    )
+    parser.add_argument(
+        "--output-path",
+        "--destination",
+        dest="output_path",
+        default=str(DEFAULT_DESTINATION_ROOT),
+        help="Raiz donde se guardaran los archivos copiados.",
+    )
+    parser.add_argument(
+        "--db-dsn",
+        default=DEFAULT_DB_DSN,
+        help="Cadena DSN para conectar a PostgreSQL. Tambien puede usarse CONSULTER_DB_DSN.",
+    )
+    parser.add_argument(
+        "--filename-mode",
+        choices=sorted(FILENAME_MODES),
+        default=os.environ.get("CONSULTER_FILENAME_MODE", "hash"),
+        help="Usa hash o el primer nombre confirmado por blake3 para nombrar el archivo copiado.",
+    )
+    parser.add_argument(
+        "--queue-path",
+        default=None,
+        help="Cola JSONL a escribir o leer si se usa --from-queue.",
+    )
+    parser.add_argument(
+        "--queue-dir",
+        default=str(DEFAULT_QUEUE_DIR),
+        help="Directorio donde se guardaran colas JSONL nuevas.",
+    )
+    parser.add_argument(
+        "--from-queue",
+        action="store_true",
+        help="No hashea; copia desde una cola JSONL existente.",
+    )
+    parser.add_argument(
+        "--include-system-dirs",
+        action="store_true",
+        help="Incluye carpetas de sistema como Windows, Program Files y ProgramData.",
+    )
+    parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Crea las tablas necesarias en la base de datos y termina.",
+    )
+    parser.add_argument(
+        "--skip-schema-init",
+        action="store_true",
+        help="Evita inicializar el esquema en la base de datos para ejecuciones en subprocessos.",
+    )
+    return parser.parse_args(argv)
+
+
+def print_summary(summary):
+    print("Resumen:")
+    print(f"  Archivos a explorar: {summary.get('total_items', 0)}")
+    print(f"  Escaneados: {summary['scanned']}")
+    print(f"  Ya registrados: {summary['already_registered']}")
+    print(f"  Reservados para copia: {summary['reserved']}")
+    print(f"  Reintentados: {summary['retried']}")
+    print(f"  Copiados: {summary['copied']}")
+    print(f"  Fallidos: {summary['failed']}")
+    if summary.get("queue_path"):
+        print(f"  Cola: {summary['queue_path']}")
+
+
+def main(argv=None):
+    args = parse_args() if argv is None else parse_args(argv)
+
+    if not args.db_dsn:
+        print(
+            "Error: No se encontro DSN de PostgreSQL. Configure CONSULTER_DB_DSN o pase --db-dsn.",
+            file=sys.stderr,
+        )
+        return 1
+
+    conn = None
+    try:
+        conn = connect_db(args.db_dsn)
+        if args.init_db:
+            ensure_schema(conn)
+            print("Esquema inicializado.")
+            return 0
+
+        if not args.root:
+            print(
+                "Error: La ruta de origen es obligatoria para ejecutar la copia. Use root.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if not args.disk_id:
+            args.disk_id = Path(args.root).name
+
+        if not args.skip_schema_init:
+            ensure_schema(conn)
+        conn.autocommit = True
+
+        destination_root = Path(args.output_path)
+        destination_root.mkdir(parents=True, exist_ok=True)
+
+        summary = run_consulter(
+            args.root,
+            args.disk_id,
+            destination_root,
+            conn,
+            queue_path=args.queue_path,
+            queue_dir=args.queue_dir,
+            from_queue=args.from_queue,
+            include_system_dirs=args.include_system_dirs,
+            filename_mode=args.filename_mode,
+        )
+        print_summary(summary)
+        return 0
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+================================================
+FILE: discos_registrados.json
+================================================
+{
+  "disk-19d3fec8b39ac0bd": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "A690-20D2",
+    "id": "disk-19d3fec8b39ac0bd",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
+    "label": "TAILS",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/TAILS",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "34bf027a-8001-4b93-8243-1f9d3dce7de7",
+    "particiones_uuid": [
+      "fsuuid:A690-20D2",
+      "partuuid:34bf027a-8001-4b93-8243-1f9d3dce7de7"
+    ],
+    "primer_registro": "2026-05-23T06:08:41.937996+00:00",
+    "serial": "Kingston_DataTraveler_3.0_4CEDFB72A4481681F9041E1A-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "17b81da0-8b1e-4269-9c39-fe5c7b9b58a3",
+    "ultima_vez_visto": "2026-05-23T17:53:43.698484+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-24d8269ef37273e6": {
+    "bus": "usb",
+    "device_node": "/dev/sdf",
+    "filesystem": "vfat",
+    "filesystem_uuid": "77CD-2E90",
+    "id": "disk-24d8269ef37273e6",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "3b71049d",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdf1",
+    "particion_uuid": "3b71049d-01",
+    "particiones_uuid": [
+      "fsuuid:77CD-2E90",
+      "partuuid:3b71049d-01"
+    ],
+    "primer_registro": "2026-05-23T05:59:04.923423+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55E6B6369F4608929731E-0:0",
+    "sys_name": "sdf",
+    "tabla_particiones_uuid": "3b71049d",
+    "ultima_vez_visto": "2026-05-23T19:44:44.110112+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-344daeff8e20297a": {
+    "bus": "ata",
+    "device_node": "/dev/sdc1",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "C6BCA8A9BCA89589",
+    "id": "disk-344daeff8e20297a",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000039c22f0a85d",
+    "label": "ADATA_HD710_PRO",
+    "modelo": "TOSHIBA_MQ04ABF100",
+    "mountpoint": "/media/uzr/ADATA HD710 PRO",
+    "nombre": "ADATA TOSHIBA MQ04ABF100",
+    "particion": "/dev/sdc2",
+    "particion_uuid": "1851f49f-aee6-4732-9a12-06a11b2f58a4",
+    "particiones_uuid": [
+      "fsuuid:C6BCA8A9BCA89589",
+      "partuuid:1851f49f-aee6-4732-9a12-06a11b2f58a4",
+      "partuuid:991a80d9-e2fd-4e98-b0f0-9c601745c204"
+    ],
+    "primer_registro": "2026-05-23T04:15:51.902740+00:00",
+    "serial": "TOSHIBA_MQ04ABF100_339SP22GT",
+    "sys_name": "sdc1",
+    "tabla_particiones_uuid": "eabfba6b-0181-4035-831f-0b035cacc9e5",
+    "ultima_vez_visto": "2026-05-23T20:58:24.659144+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000039c22f0a85d"
+  },
+  "disk-470c8fc311389738": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "2801-80A0",
+    "id": "disk-470c8fc311389738",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "3d05a00b",
+    "modelo": "Flash_Disk",
+    "mountpoint": "/media/uzr/2801-80A0",
+    "nombre": "Generic Flash Disk",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "3d05a00b-01",
+    "particiones_uuid": [
+      "fsuuid:2801-80A0",
+      "partuuid:3d05a00b-01"
+    ],
+    "primer_registro": "2026-05-23T03:19:34.794411+00:00",
+    "serial": "Generic_Flash_Disk_6EE6846D-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "3d05a00b",
+    "ultima_vez_visto": "2026-05-23T19:59:13.149770+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Generic"
+  },
+  "disk-4d666dad805f475e": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "exfat",
+    "filesystem_uuid": "A8D0-97D4",
+    "id": "disk-4d666dad805f475e",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "fa2f0801",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sde1",
+    "particion_uuid": "fa2f0801-01",
+    "particiones_uuid": [
+      "fsuuid:A8D0-97D4",
+      "partuuid:fa2f0801-01"
+    ],
+    "primer_registro": "2026-05-23T05:59:08.284379+00:00",
+    "serial": "Kingston_DataTraveler_3.0_40B0767E23B7E48126522AD8-0:0",
+    "sys_name": "sde",
+    "tabla_particiones_uuid": "fa2f0801",
+    "ultima_vez_visto": "2026-05-23T19:43:28.336571+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-5057efcd339363e0": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "vfat",
+    "filesystem_uuid": "3065-C3CF",
+    "id": "disk-5057efcd339363e0",
+    "id_fuente": "serial",
+    "id_valor": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
+    "label": "BLACK",
+    "modelo": "Cruzer_Edge",
+    "mountpoint": "/media/uzr/BLACK",
+    "nombre": "SanDisk Cruzer Edge",
+    "particion": "/dev/sde1",
+    "particiones_uuid": [
+      "fsuuid:3065-C3CF"
+    ],
+    "primer_registro": "2026-05-23T16:41:29.657839+00:00",
+    "serial": "SanDisk_Cruzer_Edge_20060164531670A07DEA-0:0",
+    "sys_name": "sde",
+    "ultima_vez_visto": "2026-05-23T19:44:44.072987+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-56abd2c1ddd7997d": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "1CD1-48FD",
+    "id": "disk-56abd2c1ddd7997d",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "1c7dbc41",
+    "label": "HERRERAMED",
+    "modelo": "STORE_N_GO",
+    "mountpoint": "/media/uzr/HERRERAMED",
+    "nombre": "Verbatim STORE N GO",
+    "particion": "/dev/sdd1",
+    "particion_uuid": "1c7dbc41-01",
+    "particiones_uuid": [
+      "fsuuid:1CD1-48FD",
+      "partuuid:1c7dbc41-01"
+    ],
+    "primer_registro": "2026-05-23T05:57:57.704053+00:00",
+    "serial": "Verbatim_STORE_N_GO_90009438A73A9904-0:0",
+    "sys_name": "sdd",
+    "tabla_particiones_uuid": "1c7dbc41",
+    "ultima_vez_visto": "2026-05-23T19:44:44.028928+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Verbatim"
+  },
+  "disk-6ce17bf2a5aed44b": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "6653-46B7",
+    "id": "disk-6ce17bf2a5aed44b",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "013853b7",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON1",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "013853b7-01",
+    "particiones_uuid": [
+      "fsuuid:6653-46B7",
+      "partuuid:013853b7-01"
+    ],
+    "primer_registro": "2026-05-23T06:02:04.747452+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55EA573D217309934035F-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "013853b7",
+    "ultima_vez_visto": "2026-05-23T19:44:44.041656+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-7ded812abdce0156": {
+    "bus": "usb",
+    "device_node": "/dev/sdc",
+    "filesystem": "vfat",
+    "filesystem_uuid": "C6DB-AA8C",
+    "id": "disk-7ded812abdce0156",
+    "id_fuente": "partition_uuids",
+    "id_valor": "fsuuid:C6DB-AA8C",
+    "label": "GADEA",
+    "modelo": "U3_Cruzer_Micro",
+    "mountpoint": "/media/uzr/GADEA",
+    "nombre": "GADEA",
+    "particion": "/dev/sdc1",
+    "particiones_uuid": [
+      "fsuuid:C6DB-AA8C"
+    ],
+    "primer_registro": "2026-05-23T17:58:10.299299+00:00",
+    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:0",
+    "sys_name": "sdc",
+    "ultima_vez_visto": "2026-05-23T19:49:55.941072+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-95cf1c27fd544126": {
+    "bus": "usb",
+    "device_node": "/dev/sdf",
+    "filesystem": "vfat",
+    "filesystem_uuid": "622D-846B",
+    "id": "disk-95cf1c27fd544126",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "360862dc",
+    "label": "CT_UMF_23",
+    "modelo": "TransMemory",
+    "mountpoint": "/media/uzr/CT UMF 23",
+    "nombre": "TOSHIBA TransMemory",
+    "particion": "/dev/sdf1",
+    "particion_uuid": "360862dc-01",
+    "particiones_uuid": [
+      "fsuuid:622D-846B",
+      "partuuid:360862dc-01"
+    ],
+    "primer_registro": "2026-05-23T04:15:49.751781+00:00",
+    "serial": "TOSHIBA_TransMemory_E9AA4B29FE1FCD91A3E8BA11-0:0",
+    "sys_name": "sdf",
+    "tabla_particiones_uuid": "360862dc",
+    "ultima_vez_visto": "2026-05-23T19:59:13.087904+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "TOSHIBA"
+  },
+  "disk-99a75b8a7f0dda90": {
+    "bus": "usb",
+    "device_node": "/dev/sde",
+    "filesystem": "vfat",
+    "filesystem_uuid": "BD6A-A610",
+    "id": "disk-99a75b8a7f0dda90",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "bdc28f98",
+    "label": "USB_DISK",
+    "modelo": "USB_DISK_2.0",
+    "mountpoint": "/media/uzr/USB DISK",
+    "nombre": "\\x20\\x20\\x20\\x20\\x20\\x20\\x20\\x20 USB DISK 2.0",
+    "particion": "/dev/sde1",
+    "particion_uuid": "bdc28f98-01",
+    "particiones_uuid": [
+      "fsuuid:BD6A-A610",
+      "partuuid:bdc28f98-01"
+    ],
+    "primer_registro": "2026-05-23T06:03:48.091970+00:00",
+    "serial": "_USB_DISK_2.0_07083872D31B4A95-0:0",
+    "sys_name": "sde",
+    "tabla_particiones_uuid": "bdc28f98",
+    "ultima_vez_visto": "2026-05-23T19:59:13.026848+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-9e4d787bfc4890b9": {
+    "bus": "usb",
+    "device_node": "/dev/sdh",
+    "filesystem": "exfat",
+    "filesystem_uuid": "A2EA-8993",
+    "id": "disk-9e4d787bfc4890b9",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "004439c0",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_3.0",
+    "mountpoint": "/media/uzr/KINGSTON",
+    "nombre": "Kingston DataTraveler 3.0",
+    "particion": "/dev/sdh1",
+    "particion_uuid": "004439c0-01",
+    "particiones_uuid": [
+      "fsuuid:A2EA-8993",
+      "partuuid:004439c0-01"
+    ],
+    "primer_registro": "2026-05-23T06:06:38.927414+00:00",
+    "serial": "Kingston_DataTraveler_3.0_E0D55E6C382B168139430176-0:0",
+    "sys_name": "sdh",
+    "tabla_particiones_uuid": "004439c0",
+    "ultima_vez_visto": "2026-05-23T19:59:13.056144+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-b95a23446c60cfdf": {
+    "bus": "usb",
+    "device_node": "/dev/sdg",
+    "filesystem": "vfat",
+    "filesystem_uuid": "1605-112C",
+    "id": "disk-b95a23446c60cfdf",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "028d17d6",
+    "label": "DPE_EVA",
+    "modelo": "USB_Flash_Drive",
+    "mountpoint": "/media/uzr/DPE_EVA",
+    "nombre": "ADATA USB Flash Drive",
+    "particion": "/dev/sdg1",
+    "particion_uuid": "028d17d6-01",
+    "particiones_uuid": [
+      "fsuuid:1605-112C",
+      "partuuid:028d17d6-01"
+    ],
+    "primer_registro": "2026-05-23T06:03:42.834626+00:00",
+    "serial": "ADATA_USB_Flash_Drive_29236003-0:0",
+    "sys_name": "sdg",
+    "tabla_particiones_uuid": "028d17d6",
+    "ultima_vez_visto": "2026-05-23T19:43:28.341776+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA"
+  },
+  "disk-db31b958c725e9e4": {
+    "bus": "usb",
+    "device_node": "/dev/sr0",
+    "id": "disk-db31b958c725e9e4",
+    "id_fuente": "serial",
+    "id_valor": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
+    "modelo": "U3_Cruzer_Micro",
+    "nombre": "SanDisk U3 Cruzer Micro",
+    "primer_registro": "2026-05-23T17:58:19.025321+00:00",
+    "serial": "SanDisk_U3_Cruzer_Micro_00001541CB63CC1A-0:1",
+    "sys_name": "sr0",
+    "ultima_vez_visto": "2026-05-23T19:43:28.462422+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "SanDisk"
+  },
+  "disk-db3f0d67ba566616": {
+    "bus": "usb",
+    "device_node": "/dev/sdd",
+    "filesystem": "vfat",
+    "filesystem_uuid": "EE2B-50C8",
+    "id": "disk-db3f0d67ba566616",
+    "id_fuente": "partition_uuids",
+    "id_valor": "fsuuid:EE2B-50C8",
+    "label": "KINGSTON",
+    "modelo": "DataTraveler_2.0",
+    "mountpoint": "/media/uzr/KINGSTON1",
+    "nombre": "KINGSTON",
+    "particion": "/dev/sdd1",
+    "particiones_uuid": [
+      "fsuuid:EE2B-50C8"
+    ],
+    "primer_registro": "2026-05-23T06:01:07.155098+00:00",
+    "serial": "Kingston_DataTraveler_2.0_5B7B1A00005C-0:0",
+    "sys_name": "sdd",
+    "ultima_vez_visto": "2026-05-23T19:43:28.383918+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "Kingston"
+  },
+  "disk-dc9d10b9b2739f2f": {
+    "bus": "ata",
+    "device_node": "/dev/sdb1",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "C21A36381A362A35",
+    "id": "disk-dc9d10b9b2739f2f",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000039c9b30371a",
+    "label": "MARTHA_DOLI_(INFO_RECIENTE)",
+    "modelo": "TOSHIBA_MQ04ABF100",
+    "mountpoint": "/media/uzr/MARTHA DOLI (INFO RECIENTE)",
+    "nombre": "ADATA TOSHIBA MQ04ABF100",
+    "particion": "/dev/sdb2",
+    "particion_uuid": "663f33be-da0e-4468-9fe4-f43a54307855",
+    "particiones_uuid": [
+      "fsuuid:C21A36381A362A35",
+      "partuuid:663f33be-da0e-4468-9fe4-f43a54307855",
+      "partuuid:c992c99d-1fb8-4f25-b8d7-bbd5b88ceeb0"
+    ],
+    "primer_registro": "2026-05-23T04:15:58.051456+00:00",
+    "serial": "TOSHIBA_MQ04ABF100_X3JSP3E0T",
+    "sys_name": "sdb1",
+    "tabla_particiones_uuid": "9906a8aa-df31-43a8-b9c4-bcf79588f640",
+    "ultima_vez_visto": "2026-05-26T17:09:26.939388+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000039c9b30371a"
+  },
+  "disk-e170ff5d93b39289": {
+    "bus": "usb",
+    "device_node": "/dev/sdb",
+    "filesystem": "vfat",
+    "filesystem_uuid": "F49C-63A1",
+    "id": "disk-e170ff5d93b39289",
+    "id_fuente": "partition_table_uuid",
+    "id_valor": "c3072e18",
+    "label": "HP_v125w",
+    "modelo": "v125w",
+    "mountpoint": "/media/uzr/HP v125w",
+    "nombre": "hp v125w",
+    "particion": "/dev/sdb1",
+    "particion_uuid": "c3072e18-01",
+    "particiones_uuid": [
+      "fsuuid:F49C-63A1",
+      "partuuid:c3072e18-01"
+    ],
+    "primer_registro": "2026-05-23T03:20:47.859111+00:00",
+    "serial": "hp_v125w_AA17141D00000199-0:0",
+    "sys_name": "sdb",
+    "tabla_particiones_uuid": "c3072e18",
+    "ultima_vez_visto": "2026-05-23T19:59:52.189655+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "hp"
+  },
+  "disk-e3b4f365b74cbe9e": {
+    "bus": "scsi",
+    "device_node": "/dev/sda",
+    "id": "disk-e3b4f365b74cbe9e",
+    "id_fuente": "weak_hardware_fallback",
+    "id_valor": "scsi",
+    "nombre": "/dev/sda",
+    "primer_registro": "2026-05-23T04:15:57.524025+00:00",
+    "sys_name": "sda",
+    "ultima_vez_visto": "2026-05-26T05:50:18.511171+00:00",
+    "ultimo_evento": "disconnect"
+  },
+  "disk-e6e2accb7d027956": {
+    "bus": "scsi",
+    "device_node": "/dev/sda3",
+    "filesystem": "ntfs",
+    "filesystem_uuid": "58ACC9AFACC98848",
+    "id": "disk-e6e2accb7d027956",
+    "id_fuente": "wwn",
+    "id_valor": "0x3043208463202400",
+    "label": "Reservado_para_el_sistema",
+    "modelo": "XPG_EX500",
+    "mountpoint": "/media/uzr/58ACC9AFACC98848",
+    "nombre": "ADATA XPG EX500",
+    "particion": "/dev/sda2",
+    "particion_uuid": "571a8e1c-02",
+    "particiones_uuid": [
+      "fsuuid:58ACC9AFACC98848",
+      "fsuuid:AC98C6FB98C6C2D6",
+      "fsuuid:BC1A50891A504316",
+      "partuuid:571a8e1c-01",
+      "partuuid:571a8e1c-02",
+      "partuuid:571a8e1c-03"
+    ],
+    "primer_registro": "2026-05-23T04:16:03.555766+00:00",
+    "serial": "1ADATA_XPG_EX500_4320846C20B4",
+    "sys_name": "sda3",
+    "tabla_particiones_uuid": "571a8e1c",
+    "ultima_vez_visto": "2026-05-26T17:09:27.209987+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x3043208463202400"
+  },
+  "disk-f4a2a59b894b550c": {
+    "bus": "scsi",
+    "device_node": "/dev/sda",
+    "id": "disk-f4a2a59b894b550c",
+    "id_fuente": "wwn",
+    "id_valor": "0x5000000000000001",
+    "modelo": "ED600",
+    "nombre": "ADATA ED600",
+    "primer_registro": "2026-05-26T05:48:19.172826+00:00",
+    "serial": "35000000000000001",
+    "sys_name": "sda",
+    "ultima_vez_visto": "2026-05-26T05:49:25.897890+00:00",
+    "ultimo_evento": "disconnect",
+    "vendor": "ADATA",
+    "wwn": "0x5000000000000001"
+  }
+}
+
+
+================================================
+FILE: explorer_hasher.py
+================================================
+import argparse
+import json
+import os
+import sys
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    from blake3 import blake3
+except ModuleNotFoundError:
+    print(
+        "Error: falta instalar el paquete 'blake3' en este entorno.\n"
+        "Activa tu virtualenv y ejecuta: pip install blake3",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+EXTS = {
+    # Documentos de Oficina y Paquetería
+    ".doc", ".docx", ".docm", ".dot", ".dotx", ".xls", ".xlsx", ".xlsm", ".xlsb",
+    ".xltx", ".csv", ".ppt", ".pptx", ".pps", ".ppsx", ".pdf", ".rtf", ".txt",
+    ".odt", ".ods", ".odp", ".pages", ".numbers", ".key",
+
+    # Comprimidos y Respaldos (Backups)
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".iso", ".vmdk",
+    ".ova", ".ovf", ".bak", ".old", ".backup",
+
+    # Contabilidad Específica y Bases de Datos
+    ".mdb", ".accdb", ".sql", ".sqlite", ".sqlite3", ".db", ".dbf", ".dat",
+    ".xml", ".json", ".qbw", ".qbb",
+
+    # Imágenes, Escaneos y Evidencias
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp", ".svg", ".heic",
+
+    # Multimedia (Clases, grabaciones, audios)
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".mp3", ".wav",
+    ".m4a", ".ogg",
+
+    # Código Fuente y Scripts de Sistemas
+    ".py", ".js", ".ts", ".php", ".java", ".class", ".jar", ".c", ".cpp", ".cs",
+    ".html", ".htm", ".css", ".sh", ".bat", ".ps1",
+
+    # Configuraciones y Llaves de Seguridad
+    ".env", ".conf", ".config", ".ini", ".yaml", ".yml", ".pem", ".key", ".pub", ".ppk",
+
+    # Diseño y Arquitectura (Planos de Redes/Edificios)
+    ".psd", ".ai", ".indd", ".dwg", ".dxf", ".3ds", ".max",
+}
+
+EXTS = frozenset(EXTS)
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_QUEUE_DIR = Path(os.environ.get("CONSULTER_HASH_QUEUE_DIR", BASE_DIR / "hash_queues"))
+CHUNK_SIZE = int(os.environ.get("CONSULTER_HASH_CHUNK_MB", "256")) * 1024 * 1024
+HASH_THREADS = int(os.environ.get("CONSULTER_HASH_THREADS", "7"))
+BATCH_SIZE = 1000
+ROOT = "/media/uzr/CT UMF 23"
+INCLUDE_SYSTEM_DIRS = os.environ.get("CONSULTER_INCLUDE_SYSTEM_DIRS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "si",
+}
+SKIP_DIR_NAMES = frozenset(
+    {
+        "$recycle.bin",
+        ".spotlight-v100",
+        ".temporaryitems",
+        ".trashes",
+        "config.msi",
+        "msocache",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "recovery",
+        "system volume information",
+        "windows",
+        "windows.old",
+        "windowsapps",
+    }
+)
+SKIP_FILE_NAMES = frozenset({"desktop.ini", "thumbs.db"})
+SKIP_FILE_PREFIXES = ("~$",)
+
+
+def safe_queue_name(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() else "_" for char in value.strip())
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    return cleaned[:80] or "disk"
+
+
+def build_queue_path(disk_id: str | None = None, queue_dir: str | Path | None = None) -> Path:
+    queue_root = Path(queue_dir) if queue_dir else DEFAULT_QUEUE_DIR
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return queue_root / f"{safe_queue_name(disk_id or 'disk')}-{timestamp}.jsonl"
+
+
+def should_skip_dir(name: str, include_system_dirs: bool | None = None) -> bool:
+    include = INCLUDE_SYSTEM_DIRS if include_system_dirs is None else include_system_dirs
+    return not include and name.strip().lower() in SKIP_DIR_NAMES
+
+
+def should_skip_file(name: str) -> bool:
+    lowered = name.strip().lower()
+    return lowered in SKIP_FILE_NAMES or any(name.startswith(prefix) for prefix in SKIP_FILE_PREFIXES)
+
+
+class HashQueueWriter:
+    def __init__(self, queue_path: str | Path, root: str):
+        self.queue_path = Path(queue_path)
+        self.status_path = self.queue_path.with_name(self.queue_path.name + ".status.json")
+        self.root = root
+        self.file = None
+        self.count = 0
+        self.started_at = datetime.now(timezone.utc).isoformat()
+
+    def __enter__(self):
+        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.queue_path.open("w", encoding="utf-8")
+        self.write_status("running")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.file:
+            self.file.flush()
+            self.file.close()
+        self.write_status("failed" if exc_type else "done")
+
+    def write_status(self, status: str):
+        payload = {
+            "status": status,
+            "root": self.root,
+            "queue_path": str(self.queue_path),
+            "count": self.count,
+            "hash_threads": HASH_THREADS,
+            "chunk_size": CHUNK_SIZE,
+            "started_at": self.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp_path = self.status_path.with_name(self.status_path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as status_file:
+            json.dump(payload, status_file, indent=2, ensure_ascii=False)
+        tmp_path.replace(self.status_path)
+
+    def write(self, digest: str, file_meta: dict[str, Any]):
+        if not self.file:
+            return
+        record = {"hash": digest, **file_meta}
+        self.file.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        self.file.write("\n")
+        self.file.flush()
+        self.count += 1
+        if self.count % BATCH_SIZE == 0:
+            self.write_status("running")
+
+
+def iter_files(root: str, include_system_dirs: bool | None = None):
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if should_skip_dir(entry.name, include_system_dirs):
+                                continue
+                            stack.append(entry.path)
+                            continue
+                        if should_skip_file(entry.name):
+                            continue
+                        _, sep, ext = entry.name.rpartition(".")
+                        if sep and ("." + ext.lower()) in EXTS:
+                            if entry.is_file(follow_symlinks=False):
+                                yield entry.path
+                    except (PermissionError, FileNotFoundError, OSError):
+                        continue
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+
+def count_files(root: str, include_system_dirs: bool | None = None) -> int:
+    return sum(1 for _path in iter_files(root, include_system_dirs=include_system_dirs))
+
+
+def hash_file(path: str) -> str | None:
+    try:
+        if os.path.getsize(path) == 0:
+            return None
+
+        hasher = blake3(max_threads=HASH_THREADS)
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    except (PermissionError, FileNotFoundError, OSError):
+        return None
+
+
+def process_batch(batch: list[str]) -> list[tuple[str, str | None]]:
+    results = []
+    for path in batch:
+        try:
+            results.append((path, hash_file(path)))
+        except OSError as e:
+            print(f"error reading {path}: {e}")
+            results.append((path, None))
+    return results
+
+
+def build_file_meta(root: str, path: str, stat_result: os.stat_result) -> dict[str, Any]:
+    return {
+        "path": path,
+        "name": os.path.basename(path),
+        "relative_path": os.path.relpath(path, root),
+        "size_bytes": stat_result.st_size,
+        "modified_at": datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).isoformat(),
+        "extension": Path(path).suffix.lower(),
+    }
+
+
+def iter_hashed_files(
+    root: str,
+    queue_path: str | Path | None = None,
+    include_system_dirs: bool | None = None,
+    progress_callback=None,
+) -> Iterable[tuple[str, dict[str, Any]]]:
+    writer_context = HashQueueWriter(queue_path, root) if queue_path else nullcontext(None)
+    with writer_context as writer:
+        scanned = 0
+        for path in iter_files(root, include_system_dirs=include_system_dirs):
+            scanned += 1
+            digest = hash_file(path)
+            if progress_callback:
+                progress_callback(scanned)
+            if not digest:
+                continue
+
+            try:
+                stat = os.stat(path)
+            except (OSError, PermissionError):
+                continue
+
+            file_meta = build_file_meta(root, path, stat)
+            if writer:
+                writer.write(digest, file_meta)
+            yield digest, file_meta
+
+
+def load_hash_queue(queue_path: str | Path) -> Iterable[tuple[str, dict[str, Any]]]:
+    with Path(queue_path).open("r", encoding="utf-8") as queue_file:
+        for line_number, line in enumerate(queue_file, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"Registro de cola invalido en linea {line_number}: {exc}", file=sys.stderr)
+                continue
+            digest = record.pop("hash", None)
+            if not digest:
+                print(f"Registro de cola sin hash en linea {line_number}", file=sys.stderr)
+                continue
+            yield digest, record
+
+
+def hash_files(root: str, include_system_dirs: bool | None = None) -> dict[str, dict[str, Any]]:
+    hashes: dict[str, dict[str, Any]] = {}
+    for digest, file_meta in iter_hashed_files(root, include_system_dirs=include_system_dirs):
+        if digest in hashes:
+            continue
+        hashes[digest] = file_meta
+    return dict(sorted(hashes.items(), key=lambda item: item[1]["path"]))
+
+
+def write_hash_queue(
+    root: str,
+    queue_path: str | Path | None = None,
+    disk_id: str | None = None,
+    include_system_dirs: bool | None = None,
+) -> Path:
+    destination = Path(queue_path) if queue_path else build_queue_path(disk_id or Path(root).name)
+    for _digest, _file_meta in iter_hashed_files(root, destination, include_system_dirs=include_system_dirs):
+        pass
+    return destination
+
+
+def run(root: str) -> dict[str, dict[str, Any]]:
+    return hash_files(root)
+
+
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Hasher incremental de discos.")
+    parser.add_argument("root", help="Ruta montada del disco a explorar.")
+    parser.add_argument("--queue-path", help="Archivo JSONL donde se escribira la cola de hashes.")
+    parser.add_argument("--queue-dir", default=str(DEFAULT_QUEUE_DIR), help="Directorio para colas JSONL.")
+    parser.add_argument("--disk-id", help="Identificador usado para nombrar la cola.")
+    parser.add_argument("--no-json", action="store_true", help="No imprime el JSON completo al terminar.")
+    parser.add_argument(
+        "--include-system-dirs",
+        action="store_true",
+        help="Incluye carpetas de sistema como Windows, Program Files y ProgramData.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    ruta_objetivo = args.root
+
+    if not os.path.exists(ruta_objetivo):
+        print(f"Error: La ruta '{ruta_objetivo}' no existe o no es accesible.")
+        return 1
+
+    if not os.path.isdir(ruta_objetivo):
+        print(f"Error: La ruta '{ruta_objetivo}' no es un directorio.")
+        return 1
+
+    queue_path = None
+    if args.queue_path:
+        queue_path = Path(args.queue_path)
+    elif args.no_json or args.disk_id:
+        queue_path = build_queue_path(args.disk_id or Path(ruta_objetivo).name, args.queue_dir)
+
+    if args.no_json:
+        count = 0
+        for count, (_digest, _file_meta) in enumerate(
+            iter_hashed_files(ruta_objetivo, queue_path, include_system_dirs=args.include_system_dirs),
+            start=1,
+        ):
+            if count % BATCH_SIZE == 0:
+                print(f"hashed {count} files...", flush=True)
+        if queue_path:
+            print(f"queue: {queue_path}")
+        print(f"done. {count} files hashed.")
+        return 0
+
+    hashes: dict[str, dict[str, Any]] = {}
+    for digest, file_meta in iter_hashed_files(
+        ruta_objetivo,
+        queue_path,
+        include_system_dirs=args.include_system_dirs,
+    ):
+        if digest not in hashes:
+            hashes[digest] = file_meta
+    hashes = dict(sorted(hashes.items(), key=lambda item: item[1]["path"]))
+    print(json.dumps(hashes, indent=2, ensure_ascii=False))
+    if queue_path:
+        print(f"queue: {queue_path}")
+    print(f"done. {len(hashes)} files hashed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+================================================
+FILE: listener.py
+================================================
+import argparse
+import getpass
+import hashlib
+import os
+import json
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import psycopg2
+import psutil
+import pyudev
+from loguru import logger
+
+
+BASE_DIR = Path(__file__).resolve().parent
+REGISTRY_PATH = BASE_DIR / "discos_registrados.json"
+LOG_PATH = BASE_DIR / "disk_listener.log"
+MOUNT_BASE = Path("/media") / getpass.getuser()
+AUTO_MOUNT_WAIT_SECONDS = 8
+UDISKSCTL_TIMEOUT_SECONDS = 25
+MANUAL_MOUNT_TIMEOUT_SECONDS = 20
+PARTITION_APPEAR_WAIT_SECONDS = 12
+DEFAULT_COPY_ROOT = Path(os.environ.get("CONSULTER_COPY_ROOT", "/home/uzr/data_full"))
+DEFAULT_PYTHON = Path(os.environ.get("PYTHON", sys.executable))
+DEFAULT_CONSULTER_DB_DSN = os.environ.get("CONSULTER_DB_DSN", "")
+
+logger.add(LOG_PATH, rotation="10 MB", level="INFO")
+
+
+class DiskListener:
+    def __init__(self):
+        self.context = pyudev.Context()
+        self.monitor = pyudev.Monitor.from_netlink(self.context)
+        self.monitor.filter_by(subsystem="block")
+        self.monitor.start()
+        self.registry_lock = threading.Lock()
+        self.active_lock = threading.Lock()
+        self.processing_lock = threading.Lock()
+        self.process_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.processing_devices = set()
+        self.registry = self.cargar_registro()
+        self.active_devices = {}
+        self.python_path = DEFAULT_PYTHON
+        self.consulter_script = BASE_DIR / "consulter_copier.py"
+        self.consulter_db_dsn = DEFAULT_CONSULTER_DB_DSN
+        self.output_root = DEFAULT_COPY_ROOT
+        self.disk_processes = {}
+        self.progress_status = {}
+        self.process_log_dir = BASE_DIR / "disk_listener_logs"
+        self.process_log_dir.mkdir(parents=True, exist_ok=True)
+
+    def cargar_registro(self):
+        if not REGISTRY_PATH.exists():
+            return {}
+
+        try:
+            with REGISTRY_PATH.open("r", encoding="utf-8") as file:
+                registry = json.load(file)
+                return self.consolidar_registro(registry)
+        except Exception as exc:
+            logger.error(f"No se pudo leer el registro {REGISTRY_PATH}: {exc}")
+            return {}
+
+    def consolidar_registro(self, registry):
+        consolidated = {}
+        identity_index = {}
+
+        for disk_id, info in registry.items():
+            identities = self.identidades_info(info)
+            target_id = None
+            for identity in identities:
+                if identity in identity_index:
+                    target_id = identity_index[identity]
+                    break
+
+            if not target_id:
+                target_id = info.get("id") or disk_id
+                consolidated[target_id] = info
+                consolidated[target_id]["id"] = target_id
+            else:
+                current = consolidated[target_id]
+                current.update({key: value for key, value in info.items() if value})
+                current["id"] = target_id
+                first_current = current.get("primer_registro")
+                first_new = info.get("primer_registro")
+                if first_current and first_new:
+                    current["primer_registro"] = min(first_current, first_new)
+                elif first_new:
+                    current["primer_registro"] = first_new
+
+            for identity in identities:
+                identity_index[identity] = target_id
+
+        return consolidated
+
+    def guardar_registro(self):
+        tmp_path = REGISTRY_PATH.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as file:
+            json.dump(self.registry, file, indent=2, ensure_ascii=False, sort_keys=True)
+        tmp_path.replace(REGISTRY_PATH)
+
+    def initialize_db_schema(self):
+        if not self.consulter_script.exists() or not self.consulter_db_dsn:
+            return False
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        command = [
+            str(self.python_path),
+            str(self.consulter_script),
+            "--db-dsn",
+            self.consulter_db_dsn,
+            "--init-db",
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+            )
+            return True
+        except subprocess.CalledProcessError as exc:
+            self.avisar(
+                f"Error inicializando esquema en PostgreSQL: {exc.stderr.strip()}",
+                "error",
+            )
+            return False
+
+    def refrescar_device(self, device, delay=0.5):
+        device_node = device.device_node
+        if not device_node:
+            return device
+
+        time.sleep(delay)
+        try:
+            return pyudev.Devices.from_device_file(self.context, device_node)
+        except Exception:
+            return device
+
+    def es_particion_montable(self, device):
+        if device.get("DEVTYPE") not in {"disk", "partition"}:
+            return False
+
+        fs_usage = device.get("ID_FS_USAGE")
+        fs_type = device.get("ID_FS_TYPE")
+        if fs_usage == "filesystem" or fs_type:
+            return True
+
+        logger.info(
+            f"Ignorando {device.device_node or device.sys_name}: "
+            "no tiene filesystem montable."
+        )
+        return False
+
+    def limpiar_nombre_montaje(self, value):
+        cleaned = value.replace("\\x20", " ").strip()
+        cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned or "DISK"
+
+    def decodificar_findmnt(self, value):
+        return re.sub(
+            r"\\x([0-9A-Fa-f]{2})",
+            lambda match: chr(int(match.group(1), 16)),
+            value,
+        )
+
+    def crear_punto_montaje_unico(self, mount_name):
+        base = MOUNT_BASE / mount_name
+        if not base.exists() or not any(base.iterdir()):
+            return base
+
+        for index in range(2, 100):
+            candidate = MOUNT_BASE / f"{mount_name}-{index}"
+            if not candidate.exists() or not any(candidate.iterdir()):
+                return candidate
+
+        return MOUNT_BASE / f"{mount_name}-{int(time.time())}"
+
+    def avisar(self, mensaje, level="info"):
+        print(mensaje, flush=True)
+        log_method = getattr(logger, level, logger.info)
+        log_method(mensaje)
+
+    def ejecutar(self, comando, timeout=20):
+        try:
+            return subprocess.run(
+                comando,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            self.avisar(f"Timeout ejecutando: {' '.join(comando)}", "warning")
+        except FileNotFoundError:
+            self.avisar(f"Comando no encontrado: {comando[0]}", "warning")
+        except Exception as exc:
+            self.avisar(f"Error ejecutando {' '.join(comando)}: {exc}", "error")
+
+        return None
+
+    def obtener_padre_disco(self, device):
+        if device.get("DEVTYPE") == "disk":
+            return device
+
+        try:
+            parent = device.find_parent("block", "disk")
+            if parent is not None:
+                return parent
+        except Exception:
+            pass
+
+        current = device
+        while current is not None:
+            if current.get("DEVTYPE") == "disk":
+                return current
+            current = current.parent
+        return device
+
+    def obtener_propiedad(self, device, keys):
+        for key in keys:
+            value = device.get(key)
+            if value:
+                return value
+        return None
+
+    def obtener_nombre(self, device, disk_device=None):
+        if disk_device is None:
+            disk_device = self.obtener_padre_disco(device)
+        label = device.get("ID_FS_LABEL") or device.get("ID_FS_LABEL_ENC")
+        model = disk_device.get("ID_MODEL") or disk_device.get("ID_MODEL_ENC")
+        vendor = disk_device.get("ID_VENDOR") or disk_device.get("ID_VENDOR_ENC")
+        serial = disk_device.get("ID_SERIAL_SHORT") or disk_device.get("ID_SERIAL")
+
+        parts = [value for value in (vendor, model) if value]
+        if label:
+            return label.replace("\\x20", " ")
+        if parts:
+            return " ".join(parts).replace("_", " ").strip()
+        if serial:
+            return f"Disco {serial}"
+        return device.device_node or device.sys_name
+
+    def particiones_del_disco(self, disk_device):
+        partitions = []
+        for partition in self.context.list_devices(subsystem="block", DEVTYPE="partition"):
+            try:
+                parent = partition.find_parent("block", "disk")
+            except Exception:
+                parent = None
+            if parent is not None and parent.sys_name == disk_device.sys_name:
+                partitions.append(partition)
+        return sorted(partitions, key=lambda item: item.sys_name)
+
+    def esperar_particiones_montables(self, disk_device, segundos=PARTITION_APPEAR_WAIT_SECONDS):
+        for elapsed in range(segundos):
+            partitions = self.particiones_del_disco(disk_device)
+            mountable = [partition for partition in partitions if self.es_particion_montable(partition)]
+            if mountable:
+                return mountable
+
+            if elapsed in {0, 4, 9}:
+                self.avisar(
+                    f"Esperando particiones montables de {disk_device.device_node or disk_device.sys_name}... "
+                    f"{elapsed + 1}/{segundos}s"
+                )
+            time.sleep(1)
+        return []
+
+    def reintentar_lectura_particiones(self, disk_device):
+        disk_node = disk_device.device_node
+        if not disk_node:
+            return
+
+        self.avisar(f"No aparecieron particiones para {disk_node}; intentando releer tabla...")
+        self.ejecutar(["udevadm", "settle"], timeout=8)
+
+        for comando in (["partprobe", disk_node], ["blockdev", "--rereadpt", disk_node]):
+            result = self.ejecutar(comando, timeout=8)
+            if result and result.returncode == 0:
+                self.avisar(f"Comando exitoso: {' '.join(comando)}")
+                self.ejecutar(["udevadm", "settle"], timeout=8)
+                return
+            if result and result.stderr.strip():
+                self.avisar(
+                    f"No se pudo ejecutar {' '.join(comando)}: {result.stderr.strip()}",
+                    "warning",
+                )
+
+    def uuid_tabla_particiones(self, disk_device, partitions):
+        table_uuid = disk_device.get("ID_PART_TABLE_UUID")
+        if table_uuid:
+            return table_uuid
+
+        for partition in partitions:
+            table_uuid = partition.get("ID_PART_TABLE_UUID")
+            if table_uuid:
+                return table_uuid
+        return None
+
+    def uuids_particiones(self, partitions):
+        values = []
+        for partition in partitions:
+            part_uuid = partition.get("ID_PART_ENTRY_UUID")
+            fs_uuid = partition.get("ID_FS_UUID")
+            if part_uuid:
+                values.append(f"partuuid:{part_uuid}")
+            if fs_uuid:
+                values.append(f"fsuuid:{fs_uuid}")
+        return sorted(set(values))
+
+    def obtener_huella_disco(self, device):
+        disk_device = self.obtener_padre_disco(device)
+        partitions = self.particiones_del_disco(disk_device)
+        serial = self.obtener_propiedad(disk_device, ["ID_SERIAL", "ID_SERIAL_SHORT"])
+        wwn = disk_device.get("ID_WWN")
+        table_uuid = self.uuid_tabla_particiones(disk_device, partitions)
+        partition_uuids = self.uuids_particiones(partitions)
+
+        if wwn:
+            return "wwn", wwn
+        if table_uuid:
+            return "partition_table_uuid", table_uuid
+        if partition_uuids:
+            return "partition_uuids", "|".join(partition_uuids)
+        if serial:
+            return "serial", serial
+
+        fallback_values = [
+            disk_device.get("ID_BUS"),
+            disk_device.get("ID_VENDOR"),
+            disk_device.get("ID_MODEL"),
+            disk_device.get("ID_REVISION"),
+            disk_device.get("size"),
+        ]
+        raw = "|".join(value for value in fallback_values if value)
+        if raw:
+            return "weak_hardware_fallback", raw
+
+        return "temporary_kernel_path", disk_device.device_path or disk_device.sys_name
+
+    def crear_id_disco(self, device):
+        source, raw = self.obtener_huella_disco(device)
+        digest = hashlib.sha256(f"{source}:{raw}".encode("utf-8")).hexdigest()[:16]
+        return f"disk-{digest}"
+
+    def huella_es_fuerte(self, source):
+        return source in {"wwn", "partition_table_uuid", "partition_uuids", "serial"}
+
+    def obtener_info_disco(self, device):
+        disk_device = self.obtener_padre_disco(device)
+        partitions = self.particiones_del_disco(disk_device)
+        id_fuente, id_raw = self.obtener_huella_disco(device)
+        disk_id = self.crear_id_disco(device)
+        return {
+            "id": disk_id,
+            "nombre": self.obtener_nombre(device, disk_device),
+            "serial": disk_device.get("ID_SERIAL") or disk_device.get("ID_SERIAL_SHORT"),
+            "wwn": disk_device.get("ID_WWN"),
+            "tabla_particiones_uuid": self.uuid_tabla_particiones(disk_device, partitions),
+            "particiones_uuid": self.uuids_particiones(partitions),
+            "id_fuente": id_fuente,
+            "id_valor": id_raw,
+            "modelo": disk_device.get("ID_MODEL"),
+            "vendor": disk_device.get("ID_VENDOR"),
+            "bus": disk_device.get("ID_BUS"),
+            "device_node": disk_device.device_node,
+            "sys_name": disk_device.sys_name,
+        }
+
+    def identidades_info(self, info):
+        identities = []
+        for key in ("wwn", "tabla_particiones_uuid"):
+            value = info.get(key)
+            if value:
+                identities.append(f"{key}:{value}")
+
+        for value in info.get("particiones_uuid") or []:
+            identities.append(f"particion_uuid:{value}")
+
+        if info.get("serial"):
+            identities.append(f"serial:{info['serial']}")
+
+        id_source = info.get("id_fuente")
+        id_value = info.get("id_valor")
+        if id_source in {"wwn", "partition_table_uuid", "partition_uuids", "serial"} and id_value:
+            identities.append(f"{id_source}:{id_value}")
+
+        return identities
+
+    def buscar_id_existente(self, info):
+        identities = set(self.identidades_info(info))
+        if not identities:
+            return None
+
+        for disk_id, saved_info in self.registry.items():
+            if identities.intersection(self.identidades_info(saved_info)):
+                return disk_id
+        return None
+
+    def registrar_disco(self, info, action):
+        with self.registry_lock:
+            now = datetime.now(timezone.utc).isoformat()
+            canonical_id = info["id"]
+            existing_id = self.buscar_id_existente(info)
+            target_id = canonical_id
+
+            if existing_id and existing_id != canonical_id:
+                existing_info = self.registry.get(existing_id, {})
+                old_source = existing_info.get("id_fuente")
+                new_source = info.get("id_fuente")
+                if not self.huella_es_fuerte(new_source) or self.huella_es_fuerte(old_source):
+                    target_id = existing_id
+                else:
+                    logger.info(
+                        f"Migrando registro {existing_id} a {canonical_id} "
+                        f"porque ahora hay huella fuerte ({new_source})."
+                    )
+            elif existing_id:
+                target_id = existing_id
+
+            current = {}
+            if existing_id and existing_id in self.registry:
+                current.update(self.registry[existing_id])
+            current.update(self.registry.get(target_id, {}))
+            current.update({key: value for key, value in info.items() if value})
+            current["id"] = target_id
+            current["ultimo_evento"] = action
+            current["ultima_vez_visto"] = now
+            current.setdefault("primer_registro", now)
+
+            if existing_id and existing_id != target_id:
+                self.registry.pop(existing_id, None)
+            self.registry[target_id] = current
+            self.guardar_registro()
+            info["id"] = target_id
+
+    def punto_montaje_actual(self, device_node):
+        result = self.ejecutar(["findmnt", "-rn", "-S", device_node, "-o", "TARGET"], timeout=5)
+        if result and result.returncode == 0 and result.stdout.strip():
+            return self.decodificar_findmnt(result.stdout.strip().splitlines()[0])
+
+        for part in psutil.disk_partitions(all=True):
+            if part.device == device_node:
+                return part.mountpoint
+        return None
+
+    def esperar_montaje(self, device_node, segundos=AUTO_MOUNT_WAIT_SECONDS):
+        for elapsed in range(segundos):
+            mountpoint = self.punto_montaje_actual(device_node)
+            if mountpoint:
+                return mountpoint
+            if elapsed in {0, 4}:
+                self.avisar(
+                    f"Esperando montaje automático de {device_node}... "
+                    f"{elapsed + 1}/{segundos}s"
+                )
+            time.sleep(1)
+        return None
+
+    def montar_con_udisksctl(self, device_node):
+        self.avisar(f"Intentando montar {device_node} con udisksctl...")
+        result = self.ejecutar(
+            ["udisksctl", "mount", "-b", device_node],
+            timeout=UDISKSCTL_TIMEOUT_SECONDS,
+        )
+        if not result or result.returncode != 0:
+            mountpoint = self.punto_montaje_actual(device_node)
+            if mountpoint:
+                self.avisar(f"{device_node} ya estaba montado en: {mountpoint}", "success")
+                return mountpoint
+
+            if result and result.stderr.strip():
+                self.avisar(
+                    f"udisksctl no pudo montar {device_node}: {result.stderr.strip()}",
+                    "warning",
+                )
+            return None
+
+        mountpoint = self.esperar_montaje(device_node, segundos=3)
+        if mountpoint:
+            return mountpoint
+
+        match = re.search(r" at (.+?)\.?$", result.stdout.strip())
+        if match:
+            return match.group(1)
+        return None
+
+    def montar_con_mount_auto(self, device, disk_id):
+        device_node = device.device_node
+        label = device.get("ID_FS_LABEL") or device.get("ID_FS_LABEL_ENC")
+        mount_name = self.limpiar_nombre_montaje(label or f"disk_listener_{disk_id}_{Path(device_node).name}")
+        mountpoint = self.crear_punto_montaje_unico(mount_name)
+        try:
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            logger.error(f"Sin permisos para crear {mountpoint}")
+            return None
+
+        mount_command = ["mount", "-t", "auto"]
+        fs_type = (device.get("ID_FS_TYPE") or "").lower()
+        if fs_type in {"vfat", "exfat", "ntfs", "ntfs3"}:
+            mount_command.extend(["-o", f"uid={os.getuid()},gid={os.getgid()},umask=022"])
+        mount_command.extend([device_node, str(mountpoint)])
+
+        self.avisar(f"Intentando montaje manual de {device_node} en {mountpoint}...")
+        result = self.ejecutar(mount_command, timeout=MANUAL_MOUNT_TIMEOUT_SECONDS)
+        if result and result.returncode == 0:
+            return str(mountpoint)
+
+        if result and result.stderr.strip():
+            self.avisar(
+                f"mount -t auto falló para {device_node}: {result.stderr.strip()}",
+                "warning",
+            )
+        return None
+
+    def montar_particion(self, device, disk_id):
+        device_node = device.device_node
+        if not device_node:
+            return None
+
+        if not self.es_particion_montable(device):
+            self.avisar(
+                f"{device_node} detectado, pero no tiene filesystem montable.",
+                "warning",
+            )
+            return None
+
+        fs_type = device.get("ID_FS_TYPE") or "desconocido"
+        label = device.get("ID_FS_LABEL") or device.get("ID_FS_LABEL_ENC") or "sin etiqueta"
+        self.avisar(f"Partición montable detectada: {device_node} | FS: {fs_type} | Nombre: {label}")
+
+        mountpoint = self.esperar_montaje(device_node)
+        if mountpoint:
+            self.avisar(f"{device_node} ya está montado en: {mountpoint}", "success")
+            return mountpoint
+
+        mountpoint = self.montar_con_udisksctl(device_node)
+        if mountpoint:
+            self.avisar(f"{device_node} montado con udisksctl en: {mountpoint}", "success")
+            return mountpoint
+
+        mountpoint = self.montar_con_mount_auto(device, disk_id)
+        if mountpoint:
+            self.avisar(f"{device_node} montado manualmente en: {mountpoint}", "success")
+            return mountpoint
+
+        self.avisar(
+            f"No se pudo montar {device_node} después de "
+            f"{AUTO_MOUNT_WAIT_SECONDS + UDISKSCTL_TIMEOUT_SECONDS + MANUAL_MOUNT_TIMEOUT_SECONDS}s. "
+            "Revisa disk_listener.log para el error de udisksctl/mount.",
+            "error",
+        )
+        return None
+
+    def iniciar_proceso_individual(self, info, mountpoint):
+        if not self.consulter_script.exists():
+            self.avisar(
+                f"No se encontró {self.consulter_script}; no se iniciará el proceso de copia.",
+                "error",
+            )
+            return
+
+        if not self.consulter_db_dsn:
+            self.avisar(
+                "CONSULTER_DB_DSN no está definido; no se iniciará el proceso de copia.",
+                "warning",
+            )
+            return
+
+        disk_id = info.get("id") or info.get("nombre") or "unknown_disk"
+        with self.process_lock:
+            proc = self.disk_processes.get(disk_id)
+            if proc is not None and proc.poll() is None:
+                self.avisar(
+                    f"Ya existe un proceso activo para {disk_id}; no se iniciará otro.",
+                    "info",
+                )
+                return
+            self.disk_processes.pop(disk_id, None)
+
+        command = [
+            str(self.python_path),
+            str(self.consulter_script),
+            mountpoint,
+            "--disk-id",
+            disk_id,
+            "--output-path",
+            str(self.output_root),
+            "--db-dsn",
+            self.consulter_db_dsn,
+            "--skip-schema-init",
+        ]
+
+        log_path = self.process_log_dir / f"{disk_id}.log"
+        self.avisar(
+            f"Iniciando proceso individual para {disk_id} en {mountpoint}. Log: {log_path}",
+            "info",
+        )
+
+        try:
+            log_file = open(log_path, "a", encoding="utf-8")
+        except Exception as exc:
+            self.avisar(
+                f"No se pudo abrir el log de proceso para {disk_id}: {exc}",
+                "error",
+            )
+            return
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        stdout_pipe = subprocess.PIPE
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=stdout_pipe,
+                stderr=log_file,
+                env=env,
+                start_new_session=True,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            self.avisar(
+                f"No se pudo iniciar el proceso de copia para {disk_id}: {exc}",
+                "error",
+            )
+            log_file.close()
+            return
+
+        log_lock = threading.Lock()
+        with self.process_lock:
+            self.disk_processes[disk_id] = proc
+
+        threading.Thread(
+            target=self.read_process_stdout,
+            args=(disk_id, log_file, proc.stdout, log_lock),
+            daemon=True,
+        ).start()
+
+        def monitor_process():
+            exit_code = proc.wait()
+            with log_lock:
+                log_file.write(f"\n=== Proceso {disk_id} finalizó con código {exit_code} ===\n")
+                log_file.flush()
+                log_file.close()
+            with self.process_lock:
+                self.disk_processes.pop(disk_id, None)
+                remaining = len(self.disk_processes)
+            if exit_code == 0:
+                self.avisar(
+                    f"Proceso individual completado: {disk_id} -> {mountpoint}",
+                    "success",
+                )
+            else:
+                self.avisar(
+                    f"Proceso individual falló ({disk_id}) con código {exit_code}",
+                    "error",
+                )
+            if remaining == 0:
+                self.avisar(
+                    "Todos los discos conectados han terminado. Puedes desconectar uno y conectar otro.",
+                    "success",
+                )
+
+        threading.Thread(target=monitor_process, daemon=True).start()
+
+    def manejar_add(self, device):
+        devtype = device.get("DEVTYPE")
+        if devtype not in {"disk", "partition"}:
+            return
+
+        device = self.refrescar_device(device)
+        devtype = device.get("DEVTYPE")
+
+        if not self.es_particion_montable(device):
+            if devtype == "disk":
+                disk_node = device.device_node or device.sys_name
+                self.avisar(f"Disco físico detectado: {disk_node}. Buscando particiones montables...")
+                mountable_partitions = self.esperar_particiones_montables(device)
+                if not mountable_partitions:
+                    self.reintentar_lectura_particiones(device)
+                    mountable_partitions = self.esperar_particiones_montables(device, segundos=5)
+
+                if not mountable_partitions:
+                    info = self.obtener_info_disco(device)
+                    self.registrar_disco(info, "connect_failed")
+                    with self.active_lock:
+                        self.active_devices[device.sys_name] = info
+                        if device.device_node:
+                            self.active_devices[device.device_node] = info
+                    table_type = device.get("ID_PART_TABLE_TYPE") or "sin tabla"
+                    table_uuid = device.get("ID_PART_TABLE_UUID") or "sin uuid"
+                    self.avisar(
+                        f"Conectado: {info['nombre']} | ID: {info['id']} | "
+                        f"Dispositivo: {disk_node} | No se pudo montar: "
+                        "el disco fue detectado, pero no existe ninguna partición montable "
+                        f"({table_type}, {table_uuid}).",
+                        "error",
+                    )
+                    return
+
+                for partition in mountable_partitions:
+                    self.procesar_evento("add", partition)
+                return
+
+            self.avisar(
+                f"Conectado: {device.device_node or device.sys_name} | "
+                "No se pudo montar: sin filesystem detectado",
+                "warning",
+            )
+            return
+
+        id_fuente, _ = self.obtener_huella_disco(device)
+        if devtype == "disk" and not self.huella_es_fuerte(id_fuente):
+            self.avisar(
+                f"Detectado {device.device_node or device.sys_name}, "
+                f"pero la huella aun es debil ({id_fuente}); intentando montar de todos modos."
+            )
+
+        info = self.obtener_info_disco(device)
+        mountpoint = None
+        if self.es_particion_montable(device):
+            mountpoint = self.montar_particion(device, info["id"])
+            info["particion"] = device.device_node
+            info["filesystem"] = device.get("ID_FS_TYPE")
+            info["filesystem_uuid"] = device.get("ID_FS_UUID")
+            info["particion_uuid"] = device.get("ID_PART_ENTRY_UUID")
+            info["label"] = device.get("ID_FS_LABEL") or device.get("ID_FS_LABEL_ENC")
+            if mountpoint:
+                info["mountpoint"] = mountpoint
+
+        self.registrar_disco(info, "connect")
+        with self.active_lock:
+            self.active_devices[device.sys_name] = info
+            if device.device_node:
+                self.active_devices[device.device_node] = info
+
+        mensaje = f"Conectado: {info['nombre']} | ID: {info['id']}"
+        if device.device_node:
+            mensaje += f" | Dispositivo: {device.device_node}"
+        if mountpoint:
+            mensaje += f" | Montado en: {mountpoint}"
+            self.avisar(mensaje, "success")
+            self.iniciar_proceso_individual(info, mountpoint)
+        else:
+            mensaje += " | No se pudo montar"
+            self.avisar(mensaje, "warning")
+
+    def obtener_id_seguro(self, raw_value):
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", str(raw_value).strip())
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        return safe.upper() if safe else "DISK"
+
+    def scan_existing_mounts(self):
+        if not MOUNT_BASE.exists():
+            return
+
+        partitions = psutil.disk_partitions(all=False)
+        for part in partitions:
+            mountpoint = part.mountpoint
+            if not mountpoint.startswith(str(MOUNT_BASE)):
+                continue
+            if mountpoint == str(MOUNT_BASE):
+                continue
+
+            device_node = part.device
+            self.avisar(f"Montaje existente detectado: {mountpoint} ({device_node})", "info")
+            try:
+                device = pyudev.Devices.from_device_file(self.context, device_node)
+            except Exception:
+                device = None
+
+            if device is not None:
+                self.procesar_evento("add", device)
+            else:
+                disk_id = self.obtener_id_seguro(Path(mountpoint).name)
+                info = {"id": disk_id, "nombre": Path(mountpoint).name}
+                self.iniciar_proceso_individual(info, mountpoint)
+
+    def test_db_connection(self):
+        if not self.consulter_db_dsn:
+            self.avisar(
+                "CONSULTER_DB_DSN no está definido; no se puede iniciar el listener.",
+                "error",
+            )
+            return False
+        try:
+            conn = psycopg2.connect(self.consulter_db_dsn)
+            conn.close()
+            return True
+        except Exception as exc:
+            self.avisar(
+                f"Error de conexión a la base de datos: {exc}",
+                "error",
+            )
+            return False
+
+    def format_progress_bar(self, current: int, total: int, width: int = 30) -> str:
+        if total <= 0:
+            return f"procesados {current} archivos..."
+        ratio = min(max(current / total, 0.0), 1.0)
+        filled = int(ratio * width)
+        bar = "█" * filled + "-" * (width - filled)
+        return f"[{bar}] {int(ratio * 100):3d}% ({current}/{total})"
+
+    def update_progress(self, disk_id: str, current: int, total: int):
+        with self.progress_lock:
+            self.progress_status[disk_id] = (current, total)
+            bar = self.format_progress_bar(current, total)
+            print(f"[{disk_id}] {bar}", flush=True)
+
+    def read_process_stdout(self, disk_id: str, log_file, stdout_pipe, log_lock):
+        try:
+            assert stdout_pipe is not None
+            for raw_line in iter(stdout_pipe.readline, ""):
+                if not raw_line:
+                    break
+                stripped = raw_line.rstrip("\n")
+                if stripped.startswith("PROGRESS:"):
+                    parts = stripped.split(":")
+                    if len(parts) == 4:
+                        _, parsed_id, current, total = parts
+                        if parsed_id == disk_id:
+                            try:
+                                self.update_progress(parsed_id, int(current), int(total))
+                            except ValueError:
+                                pass
+                    continue
+                with log_lock:
+                    log_file.write(raw_line)
+                    log_file.flush()
+        finally:
+            if stdout_pipe is not None:
+                stdout_pipe.close()
+
+    def manejar_remove(self, device):
+        with self.active_lock:
+            info = self.active_devices.get(device.sys_name)
+            if not info and device.device_node:
+                info = self.active_devices.get(device.device_node)
+        if not info:
+            info = self.obtener_info_disco(device)
+
+        self.registrar_disco(info, "disconnect")
+        mensaje = f"Desconectado: {info['nombre']} | ID: {info['id']}"
+        if device.device_node:
+            mensaje += f" | Dispositivo: {device.device_node}"
+
+        self.avisar(mensaje, "warning")
+
+    def clave_evento(self, action, device):
+        return action, device.device_node or device.sys_name or device.device_path
+
+    def procesar_evento(self, action, device):
+        key = self.clave_evento(action, device)
+        with self.processing_lock:
+            if key in self.processing_devices:
+                return
+            self.processing_devices.add(key)
+
+        try:
+            if action == "add":
+                self.manejar_add(device)
+            elif action == "remove":
+                self.manejar_remove(device)
+        except Exception as exc:
+            logger.exception(f"Error procesando evento {action}: {exc}")
+        finally:
+            with self.processing_lock:
+                self.processing_devices.discard(key)
+
+    def iniciar(self):
+        self.avisar("Listener de discos activo. Conecta o desconecta un disco.")
+        if not self.test_db_connection():
+            self.avisar("El listener no puede iniciarse sin conexión válida a la base de datos.", "error")
+            return
+
+        if not self.initialize_db_schema():
+            self.avisar("No se pudo inicializar el esquema de la base de datos. El listener no continuará.", "error")
+            return
+
+        self.scan_existing_mounts()
+
+        for action, device in self.monitor:
+            thread = threading.Thread(
+                target=self.procesar_evento,
+                args=(action, device),
+                daemon=True,
+            )
+            thread.start()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Listener de discos que lanza un proceso independiente por disco conectado."
+    )
+    parser.add_argument(
+        "--db-dsn",
+        default=DEFAULT_CONSULTER_DB_DSN,
+        help="Cadena DSN de PostgreSQL para el copiador (puede usarse CONSULTER_DB_DSN).",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=str(DEFAULT_COPY_ROOT),
+        help="Raíz donde se guardarán los archivos copiados.",
+    )
+    parser.add_argument(
+        "--python",
+        default=str(DEFAULT_PYTHON),
+        help="Ruta al intérprete de Python para ejecutar consulter_copier.py.",
+    )
+    parser.add_argument(
+        "--log-path",
+        default=str(LOG_PATH),
+        help="Ruta del log del listener.",
+    )
+    parser.add_argument(
+        "--process-log-dir",
+        default=str(BASE_DIR / "disk_listener_logs"),
+        help="Directorio donde se guardarán los logs de cada proceso individual.",
+    )
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    logger.remove()
+    logger.add(args.log_path, rotation="10 MB", level="INFO")
+    app = DiskListener()
+    app.consulter_db_dsn = args.db_dsn
+    app.output_root = Path(args.output_root)
+    app.python_path = Path(args.python)
+    app.process_log_dir = Path(args.process_log_dir)
+    app.process_log_dir.mkdir(parents=True, exist_ok=True)
+    app.iniciar()
+
+
+
+================================================
+FILE: menu.py
+================================================
+import getpass
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "backup_profiles.json"
+COPIER_SCRIPT = BASE_DIR / "consulter_copier.py"
+MOUNT_BASE = Path("/media") / getpass.getuser()
+DEFAULT_COPY_ROOT = Path(os.environ.get("CONSULTER_COPY_ROOT", "/home/uzr/data_full"))
+DEFAULT_PERSONAL_COPY_ROOT = Path(os.environ.get("CONSULTER_PERSONAL_COPY_ROOT", "/home/uzr/data_full_personal"))
+DEFAULT_WORKERS = int(os.environ.get("CONSULTER_HASH_THREADS", "7"))
+PYTHON_BIN = Path(os.environ.get("CONSULTER_PYTHON", "/home/uzr/v_envs/Scrapper/bin/python"))
+if not PYTHON_BIN.exists():
+    PYTHON_BIN = Path(sys.executable)
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def dsn_from_env(db_name: str | None = None) -> str:
+    env_file = read_env_file(BASE_DIR / ".env")
+    existing = os.environ.get("CONSULTER_DB_DSN")
+    if existing:
+        return replace_db_name(existing, db_name) if db_name else existing
+
+    name = db_name or env_file.get("DB_NAME") or "scrapper"
+    parts = [f"dbname={name}"]
+    if env_file.get("DB_USER"):
+        parts.append(f"user={env_file['DB_USER']}")
+    if env_file.get("DB_PASS"):
+        parts.append(f"password={env_file['DB_PASS']}")
+    if env_file.get("DB_HOST"):
+        parts.append(f"host={env_file['DB_HOST']}")
+    if env_file.get("DB_PORT"):
+        parts.append(f"port={env_file['DB_PORT']}")
+    return " ".join(parts)
+
+
+def replace_db_name(dsn: str, db_name: str | None) -> str:
+    if not db_name:
+        return dsn
+    parts = shlex.split(dsn)
+    replaced = False
+    for index, part in enumerate(parts):
+        if part.startswith("dbname="):
+            parts[index] = f"dbname={db_name}"
+            replaced = True
+            break
+    if not replaced:
+        parts.insert(0, f"dbname={db_name}")
+    return " ".join(parts)
+
+
+def default_config() -> dict:
+    return {
+        "active_profile": "resistencia",
+        "filename_mode": "hash",
+        "profiles": {
+            "resistencia": {
+                "db_dsn": dsn_from_env(),
+                "copy_root": str(DEFAULT_COPY_ROOT),
+            },
+            "personal": {
+                "db_dsn": dsn_from_env("personal"),
+                "copy_root": str(DEFAULT_PERSONAL_COPY_ROOT),
+            },
+        },
+    }
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        config = default_config()
+        save_config(config)
+        return config
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        config = default_config()
+    defaults = default_config()
+    config.setdefault("active_profile", defaults["active_profile"])
+    config.setdefault("filename_mode", defaults["filename_mode"])
+    config.setdefault("profiles", {})
+    for name, profile in defaults["profiles"].items():
+        config["profiles"].setdefault(name, profile)
+    save_config(config)
+    return config
+
+
+def save_config(config: dict):
+    tmp_path = CONFIG_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(CONFIG_PATH)
+
+
+def prompt(default_prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    try:
+        value = input(f"{default_prompt}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
+    return value if value else (default or "")
+
+
+def prompt_int(label: str, default: int, minimum: int = 1) -> int:
+    while True:
+        value = prompt(label, str(default))
+        try:
+            parsed = int(value)
+        except ValueError:
+            print("Ingresa un numero valido.")
+            continue
+        if parsed < minimum:
+            print(f"Debe ser mayor o igual a {minimum}.")
+            continue
+        return parsed
+
+
+def active_profile(config: dict) -> tuple[str, dict]:
+    name = config.get("active_profile") or "resistencia"
+    profiles = config.setdefault("profiles", {})
+    if name not in profiles:
+        profiles[name] = default_config()["profiles"]["resistencia"]
+    return name, profiles[name]
+
+
+def configure(config: dict):
+    print("\nConfigurar")
+    print("Perfiles disponibles:")
+    for name in sorted(config["profiles"]):
+        marker = "*" if name == config.get("active_profile") else " "
+        print(f" {marker} {name}")
+
+    profile_name = prompt("Perfil a editar", config.get("active_profile", "resistencia"))
+    profile = config["profiles"].setdefault(
+        profile_name,
+        {"db_dsn": dsn_from_env(profile_name if profile_name == "personal" else None), "copy_root": str(DEFAULT_COPY_ROOT)},
+    )
+    profile["db_dsn"] = prompt("Ubicacion/DSN de base de datos", profile.get("db_dsn", ""))
+    profile["copy_root"] = prompt("Carpeta donde se copian archivos", profile.get("copy_root", str(DEFAULT_COPY_ROOT)))
+
+    activate = prompt("Usar este perfil como activo? (s/n)", "s" if profile_name == config.get("active_profile") else "n")
+    if activate.lower().startswith("s"):
+        config["active_profile"] = profile_name
+
+    print("\nModo de nombre de archivo:")
+    print(" 1. hash blake3")
+    print(" 2. primer nombre confirmado por blake3")
+    current_mode = config.get("filename_mode", "hash")
+    default_choice = "2" if current_mode == "first_name" else "1"
+    choice = prompt("Elige modo", default_choice)
+    config["filename_mode"] = "first_name" if choice == "2" else "hash"
+
+    save_config(config)
+    print(f"Configuracion guardada en {CONFIG_PATH}\n")
+
+
+def run_lsblk() -> list[dict]:
+    command = [
+        "lsblk",
+        "-J",
+        "-o",
+        "PATH,NAME,TYPE,SIZE,LABEL,FSTYPE,MOUNTPOINT,TRAN,MODEL",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr.strip() or "No se pudo ejecutar lsblk.")
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    disks: list[dict] = []
+
+    def walk(node: dict, parent: dict | None = None):
+        inherited = parent or {}
+        merged = {
+            "path": node.get("path"),
+            "name": node.get("name"),
+            "type": node.get("type"),
+            "size": node.get("size"),
+            "label": node.get("label"),
+            "fstype": node.get("fstype"),
+            "mountpoint": node.get("mountpoint"),
+            "tran": node.get("tran") or inherited.get("tran"),
+            "model": node.get("model") or inherited.get("model"),
+        }
+        if merged["type"] == "part" and merged["fstype"]:
+            disks.append(merged)
+        for child in node.get("children") or []:
+            walk(child, merged)
+
+    for block in payload.get("blockdevices") or []:
+        walk(block)
+    return disks
+
+
+def disk_label(entry: dict) -> str:
+    label = entry.get("label") or entry.get("model") or entry.get("name") or entry.get("path")
+    bits = [label]
+    if entry.get("size"):
+        bits.append(entry["size"])
+    if entry.get("fstype"):
+        bits.append(entry["fstype"])
+    if entry.get("mountpoint"):
+        bits.append(f"montado: {entry['mountpoint']}")
+    else:
+        bits.append("sin montar")
+    return " | ".join(bits)
+
+
+def mount_entry(entry: dict) -> str | None:
+    if entry.get("mountpoint"):
+        return entry["mountpoint"]
+    device_path = entry.get("path")
+    if not device_path:
+        return None
+    result = subprocess.run(["udisksctl", "mount", "-b", device_path], capture_output=True, text=True)
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        print(output.strip() or f"No se pudo montar {device_path}.")
+        return None
+    match = re.search(r" at (.+?)\.?$", output.strip())
+    if match:
+        return match.group(1)
+    for refreshed in run_lsblk():
+        if refreshed.get("path") == device_path and refreshed.get("mountpoint"):
+            return refreshed["mountpoint"]
+    return None
+
+
+def find_mountpoint(path: Path) -> Path:
+    current = path.resolve()
+    while current != current.parent:
+        if os.path.ismount(current):
+            return current
+        current = current.parent
+    return current
+
+
+def validate_manual_path(raw_path: str) -> tuple[bool, Path | None, str]:
+    if not raw_path.strip():
+        return False, None, "No se ingreso ruta."
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        return False, path, "La carpeta no existe o no esta montada."
+    if not path.is_dir():
+        return False, path, "La ruta existe, pero no es una carpeta."
+    try:
+        mountpoint = find_mountpoint(path)
+    except OSError:
+        return False, path, "La carpeta no es accesible o no esta montada."
+    if str(path).startswith(str(MOUNT_BASE)) and mountpoint == Path("/"):
+        return False, path, "La carpeta parece estar bajo /media, pero no esta montada."
+    return True, path, ""
+
+
+def render_progress(current: int, total: int, width: int = 34):
+    if total <= 0:
+        sys.stdout.write(f"\rProcesados {current} archivos...")
+        sys.stdout.flush()
+        return
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = int(ratio * 100)
+    sys.stdout.write(f"\r[{bar}] {percent:3d}% ({current}/{total})")
+    sys.stdout.flush()
+
+
+def run_copier_for_path(config: dict, source_path: Path, disk_id: str):
+    profile_name, profile = active_profile(config)
+    workers = prompt_int("Workers para blake3", DEFAULT_WORKERS)
+    copy_root = Path(profile["copy_root"]).expanduser()
+    copy_root.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        str(PYTHON_BIN),
+        str(COPIER_SCRIPT),
+        str(source_path),
+        "--disk-id",
+        disk_id,
+        "--output-path",
+        str(copy_root),
+        "--db-dsn",
+        profile["db_dsn"],
+        "--filename-mode",
+        config.get("filename_mode", "hash"),
+    ]
+    env = os.environ.copy()
+    env["CONSULTER_HASH_THREADS"] = str(workers)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print(f"\nPerfil: {profile_name}")
+    print(f"Origen: {source_path}")
+    print(f"Destino: {copy_root}")
+    print(f"Modo nombre: {config.get('filename_mode', 'hash')}")
+    print(f"Workers blake3: {workers}\n")
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        bufsize=1,
+    )
+    progress_active = False
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.rstrip("\n")
+        if line.startswith("PROGRESS:"):
+            parts = line.split(":")
+            if len(parts) == 4:
+                try:
+                    render_progress(int(parts[2]), int(parts[3]))
+                    progress_active = True
+                except ValueError:
+                    pass
+            continue
+        if progress_active:
+            print()
+            progress_active = False
+        print(line)
+    if progress_active:
+        print()
+    exit_code = process.wait()
+    print(f"Proceso terminado con codigo {exit_code}\n")
+
+
+def choose_disk(config: dict):
+    disks = run_lsblk()
+    external = [disk for disk in disks if disk.get("path") and disk.get("path") not in {"/dev/nvme0n1p1", "/dev/nvme0n1p2"}]
+    if not external:
+        print("No se encontraron discos/particiones externas con filesystem.")
+        return
+    print("\nDiscos/particiones detectadas:")
+    for index, entry in enumerate(external, start=1):
+        print(f" {index}. {disk_label(entry)}")
+    choice = prompt_int("Elige disco", 1)
+    if choice < 1 or choice > len(external):
+        print("Opcion fuera de rango.")
+        return
+    entry = external[choice - 1]
+    mountpoint = mount_entry(entry)
+    if not mountpoint:
+        print("No se pudo montar o localizar el disco elegido.")
+        return
+    label = entry.get("label") or entry.get("model") or entry.get("name") or Path(mountpoint).name
+    run_copier_for_path(config, Path(mountpoint), label)
+
+
+def manual_path(config: dict):
+    raw_path = prompt("Ruta de carpeta a explorar")
+    ok, path, message = validate_manual_path(raw_path)
+    if not ok:
+        print(message)
+        return
+    assert path is not None
+    disk_id = prompt("Nombre para esta ejecucion", path.name or "manual")
+    run_copier_for_path(config, path, disk_id)
+
+
+def main():
+    config = load_config()
+    while True:
+        profile_name, profile = active_profile(config)
+        print("\nMenu de respaldo")
+        print(f"Perfil activo: {profile_name}")
+        print(f"Destino: {profile.get('copy_root')}")
+        print(f"Modo nombre: {config.get('filename_mode', 'hash')}")
+        print(" 1. Iniciar desde disco conectado")
+        print(" 2. Iniciar desde una carpeta/ruta")
+        print(" 3. Configurar")
+        print(" q. Salir")
+        try:
+            choice = input("Opcion: ").strip().lower()
+        except EOFError:
+            print()
+            break
+        if choice == "1":
+            choose_disk(config)
+        elif choice == "2":
+            manual_path(config)
+        elif choice == "3":
+            configure(config)
+        elif choice in {"q", "quit", "salir"}:
+            break
+        else:
+            print("Opcion no valida.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: run_usb_copy.sh
+================================================
+#!/bin/bash
+set -euo pipefail
+
+# Wrapper for code/consulter_copier.py to process USB disks and write a per-disk log.
+# Usage:
+#   CONSULTER_DB_DSN="dbname=scrapper" ./run_usb_copy.sh
+# or export CONSULTER_DB_DSN first.
+
+DB_DSN=${CONSULTER_DB_DSN:-}
+if [[ -z "$DB_DSN" ]]; then
+  echo "Error: CONSULTER_DB_DSN is not set. Export it before running the script."
+  echo "Example: export CONSULTER_DB_DSN='dbname=scrapper'"
+  exit 1
+fi
+
+PYTHON="/home/uzr/v_envs/Scrapper/bin/python"
+CONSULTER="/home/uzr/code/consulter_copier.py"
+OUTPUT_ROOT="/home/uzr/data_full"
+LOG_FILE="/home/uzr/code/usb_copy_run.log"
+MOUNT_ROOT="/media/$(whoami)"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$OUTPUT_ROOT"
+
+exec >>"$LOG_FILE" 2>&1
+
+echo "========================================"
+echo "USB copy run started: $(date +'%F %T')"
+echo "DB DSN: ${DB_DSN}"
+echo "Output root: ${OUTPUT_ROOT}"
+echo "Log file: ${LOG_FILE}"
+echo "Mount root: ${MOUNT_ROOT}"
+echo ""
+
+if [[ ! -d "$MOUNT_ROOT" ]]; then
+  echo "ERROR: mount root does not exist: ${MOUNT_ROOT}"
+  exit 1
+fi
+
+mapfile -t MOUNT_PATHS < <(find "$MOUNT_ROOT" -maxdepth 1 -mindepth 1 -type d | sort)
+if [[ ${#MOUNT_PATHS[@]} -eq 0 ]]; then
+  echo "No mounted disks found under ${MOUNT_ROOT}."
+  exit 1
+fi
+
+sanitize_disk_id() {
+  local label="$1"
+  local sanitized
+  sanitized=$(basename "$label" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g' | sed 's/^_*//; s/_*$//; s/_\+/_/g')
+  if [[ -z "$sanitized" ]]; then
+    sanitized="DISK_$2"
+  fi
+  echo "$sanitized"
+}
+
+for i in "${!MOUNT_PATHS[@]}"; do
+  mount_path="${MOUNT_PATHS[$i]}"
+  disk_id=$(sanitize_disk_id "$mount_path" "$((i + 1))")
+
+  echo "---"
+  echo "Processing disk: ${disk_id}"
+  echo "Mount path: ${mount_path}"
+  echo "Start: $(date +'%F %T')"
+
+  if [[ ! -d "$mount_path" ]]; then
+    echo "ERROR: mount path does not exist: ${mount_path}"
+    continue
+  fi
+
+  set +e
+  PYTHONUNBUFFERED=1 "$PYTHON" "$CONSULTER" "$mount_path" \
+    --disk-id "$disk_id" \
+    --output-path "$OUTPUT_ROOT" \
+    --db-dsn "$DB_DSN"
+  rc=$?
+  set -e
+
+  echo "Exit code: $rc"
+  echo "End: $(date +'%F %T')"
+  echo ""
+done
+
+echo "USB copy run finished: $(date +'%F %T')"
+echo "========================================"
+
+
+
+================================================
+FILE: to_run.txt
+================================================
+/home/uzr/v_envs/Scrapper/bin/python3 /home/uzr/code/listener_2.py --db-dsn 'dbname=scrapper' --output-root /home/uzr/data_full
+/home/uzr/v_envs/Scrapper/bin/python /home/uzr/code/menu.py
+
+
+================================================
+FILE: hash_queues/backup_limpio-20260708T233057Z.jsonl
+================================================
+{"extension": ".pdf", "hash": "c5e65a97a4cc4acebb0bc4990d7d15e4e86aa32427e461b1e84214a46edc03d6", "modified_at": "2024-06-14T21:35:22+00:00", "name": "LuisÁngelRamosGarcía_tesis.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LuisÁngelRamosGarcía_tesis.pdf", "relative_path": "pdf/LuisÁngelRamosGarcía_tesis.pdf", "size_bytes": 1246533}
+{"extension": ".pdf", "hash": "45613f5227525985f79ed3c34d7efdecac0d6fe00c8f8b91e1797a4d15a6c6df", "modified_at": "2024-06-13T22:51:12+00:00", "name": "REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "relative_path": "pdf/REQUISITOS PARA TRÁMITE DE TITULACIÓN.pdf", "size_bytes": 225392}
+{"extension": ".pdf", "hash": "0e55638573c37ea0c3682691ddbec4c58f5ba1eb3511efda84b9eac2dfa3e19b", "modified_at": "2023-03-06T01:21:49+00:00", "name": "Prob1-2016.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Prob1-2016.pdf", "relative_path": "pdf/Prob1-2016.pdf", "size_bytes": 5161261}
+{"extension": ".pdf", "hash": "8df25c08c112f71499ccc1b0103d41573729b5715e8b3013ed310c8c3a5c8fda", "modified_at": "2022-08-20T17:51:26+00:00", "name": "Speech and Language Processing - Jurafsky.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Speech and Language Processing - Jurafsky.pdf", "relative_path": "pdf/Speech and Language Processing - Jurafsky.pdf", "size_bytes": 19095165}
+{"extension": ".pdf", "hash": "543c0bc2e4bcc73f8e483b7b64f1d23914a6459eb06df68f386cc6c4f8d8caa5", "modified_at": "2025-07-01T20:15:22.740728+00:00", "name": "Toma de materias.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Toma de materias.pdf", "relative_path": "pdf/Toma de materias.pdf", "size_bytes": 361160}
+{"extension": ".pdf", "hash": "5bb353b4763d6e993bef0f53a51e242c3ca0b4655d193b20e985ccc1e7c840fd", "modified_at": "2023-06-02T05:17:16.200418+00:00", "name": "James_Clustering_pdf.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/James_Clustering_pdf.pdf", "relative_path": "pdf/James_Clustering_pdf.pdf", "size_bytes": 1348174}
+{"extension": ".pdf", "hash": "b86f66be5d30e3359dba0737bba782d921a23c481eabd9c85bc50edb19eca304", "modified_at": "2023-05-09T20:17:05+00:00", "name": "neurons_rojas.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/neurons_rojas.pdf", "relative_path": "pdf/neurons_rojas.pdf", "size_bytes": 4576797}
+{"extension": ".pdf", "hash": "2fd4818e4f32b184371547d2ca35900b0bc0651bc754ecb99fb853d1172e2af2", "modified_at": "2024-04-25T19:02:57+00:00", "name": "Spherical_k-Means_Clustering.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Spherical_k-Means_Clustering.pdf", "relative_path": "pdf/Spherical_k-Means_Clustering.pdf", "size_bytes": 406887}
+{"extension": ".pdf", "hash": "383076066d199ae0348fadde8f834c4ee3ca6da4f630a2271888d1fce7cf1531", "modified_at": "2024-06-15T02:47:40+00:00", "name": "LuisÁngelRamosGarcía_formato.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LuisÁngelRamosGarcía_formato.pdf", "relative_path": "pdf/LuisÁngelRamosGarcía_formato.pdf", "size_bytes": 9888227}
+{"extension": ".pdf", "hash": "2432a388e1f26278aafe3bb4113af18bdf268df0a6ba9c8facca4008997f5f4b", "modified_at": "2022-12-14T19:48:30+00:00", "name": "Procesos_Estocasticos.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Procesos_Estocasticos.pdf", "relative_path": "pdf/Procesos_Estocasticos.pdf", "size_bytes": 177100}
+{"extension": ".pdf", "hash": "3f84e2cb742df885ff84ef9be08c038ffd154516a93f76a457d33bcbcf1fbc02", "modified_at": "2022-08-29T00:08:46+00:00", "name": "Solicitud.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solicitud.pdf", "relative_path": "pdf/Solicitud.pdf", "size_bytes": 83192}
+{"extension": ".pdf", "hash": "3828f11964d315f4c796bad5d9a36bd397bad3fec3cd6893c8c3fbe318e6235e", "modified_at": "2024-05-20T17:54:26+00:00", "name": "Presentacion_Final_Anteproyecto.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Presentacion_Final_Anteproyecto.pdf", "relative_path": "pdf/Presentacion_Final_Anteproyecto.pdf", "size_bytes": 1673098}
+{"extension": ".pdf", "hash": "aaba6c5f08736c80a0234242a0012b5209405ccf7111cde4e51fc8b57191f974", "modified_at": "2024-06-14T21:28:49+00:00", "name": "Tesis_James (2).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James (2).pdf", "relative_path": "pdf/Tesis_James (2).pdf", "size_bytes": 874206}
+{"extension": ".pdf", "hash": "8b7ddb4842d1a717d549d5bddb8b24a2518621c9cb8807a0891a59dc59a382c6", "modified_at": "2023-02-10T23:03:43+00:00", "name": "vigenciaimss.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/vigenciaimss.pdf", "relative_path": "pdf/vigenciaimss.pdf", "size_bytes": 54160}
+{"extension": ".pdf", "hash": "90eed5e6ed36ee850c22ce1c175729686fa092124442e96e6685835a143c45bc", "modified_at": "2023-02-16T01:51:46+00:00", "name": "RECIBO_0005598FEB2023.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/RECIBO_0005598FEB2023.pdf", "relative_path": "pdf/RECIBO_0005598FEB2023.pdf", "size_bytes": 181141}
+{"extension": ".pdf", "hash": "7c5bbf963e2521f5d67e496b9903dd5217e89d27d715dc0715e60c5136d3618b", "modified_at": "2023-11-07T17:54:23+00:00", "name": "NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "relative_path": "pdf/NIPS-2002-an-impossibility-theorem-for-clustering-Paper.pdf", "size_bytes": 93960}
+{"extension": ".pdf", "hash": "563e6c1641ed2ce6e62972633979900d5f6b588f016cec6d63a3948ce841456f", "modified_at": "2024-06-13T23:01:14+00:00", "name": "VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "relative_path": "pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL.PDF", "size_bytes": 371777}
+{"extension": ".pdf", "hash": "429ec2449eaa4e007c7da9b2a90db439283d0026138465e88279f5bb3d51828c", "modified_at": "2022-08-20T17:51:13+00:00", "name": "Manning_Schuetze_StatisticalNLP.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Manning_Schuetze_StatisticalNLP.pdf", "relative_path": "pdf/Manning_Schuetze_StatisticalNLP.pdf", "size_bytes": 11910301}
+{"extension": ".pdf", "hash": "4f801705dafcad98e3e915dfc3f9931b612bdd96c9ad576c8ae6d4016aca1dc5", "modified_at": "2023-03-30T01:49:04+00:00", "name": "Solucion_Tarea_01_PROBABILIDAD.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_01_PROBABILIDAD.pdf", "relative_path": "pdf/Solucion_Tarea_01_PROBABILIDAD.pdf", "size_bytes": 3851565}
+{"extension": ".pdf", "hash": "8d786755a0d1daa34e22effda3b4fb7854ab1fefaf4a07662f772dd8bda99325", "modified_at": "2023-05-02T21:45:01+00:00", "name": "Procesamiento_Predictivo.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Procesamiento_Predictivo.pdf", "relative_path": "pdf/Procesamiento_Predictivo.pdf", "size_bytes": 3373212}
+{"extension": ".pdf", "hash": "db83f41ff0a4650ba106585bc46411d86db1bac00291d14e129b612a9908f4d9", "modified_at": "2022-12-05T08:01:20+00:00", "name": "por si no hay net xd modelacion.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/por si no hay net xd modelacion.pdf", "relative_path": "pdf/por si no hay net xd modelacion.pdf", "size_bytes": 2371922}
+{"extension": ".pdf", "hash": "e74c90fd5718c1c51d3b5eb4e33b31317145f71ad8b0416528e5a40fe6ca35d0", "modified_at": "2025-07-01T20:02:20.031571+00:00", "name": "Seminarios (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Seminarios (1).pdf", "relative_path": "pdf/Seminarios (1).pdf", "size_bytes": 592024}
+{"extension": ".pdf", "hash": "5c4c75d3b976d7c79c9335ffc81e16eb70ec223703bec861e9098232534e120c", "modified_at": "2023-06-20T01:40:50+00:00", "name": "pre-pre(preresidenciaypre-presentacion).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/pre-pre(preresidenciaypre-presentacion).pdf", "relative_path": "pdf/pre-pre(preresidenciaypre-presentacion).pdf", "size_bytes": 10040713}
+{"extension": ".pdf", "hash": "a401fe7f62235c0f7b8783bba5151045783ade71cf1a022aa1216b99688ca6e4", "modified_at": "2023-03-12T18:20:46+00:00", "name": "minicv.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/minicv.pdf", "relative_path": "pdf/minicv.pdf", "size_bytes": 2408512}
+{"extension": ".pdf", "hash": "da784f6ba9d92ca8bbbb5342a4bda3b0a8380f2bbfda94a7a885f42ced2ee2c6", "modified_at": "2022-09-26T13:32:05+00:00", "name": "tutoriaRamos.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/tutoriaRamos.pdf", "relative_path": "pdf/tutoriaRamos.pdf", "size_bytes": 194679}
+{"extension": ".pdf", "hash": "238cd8757d89eba75c71dcc537e7eb4af064a25877ff9057d29511c3193bfbcd", "modified_at": "2023-03-06T01:21:58+00:00", "name": "procesos2012.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/procesos2012.pdf", "relative_path": "pdf/procesos2012.pdf", "size_bytes": 1913766}
+{"extension": ".pdf", "hash": "adc9c4e32dba8536a44f9d03f32b8b85041d6fb0a03fa6342be41c74dc2e95fc", "modified_at": "2024-12-05T21:12:08.410906+00:00", "name": "MC Luis Ángel Ramos García ANEXO_UNO.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/MC Luis Ángel Ramos García ANEXO_UNO.pdf", "relative_path": "pdf/MC Luis Ángel Ramos García ANEXO_UNO.pdf", "size_bytes": 280100}
+{"extension": ".pdf", "hash": "25eb41d98cefa639c8c77e7dc15543023e803320ac2b506e72b73c69f4080122", "modified_at": "2025-09-18T15:28:23.886612+00:00", "name": "POLIZA_WEB_93001634772147220267.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/POLIZA_WEB_93001634772147220267.pdf", "relative_path": "pdf/POLIZA_WEB_93001634772147220267.pdf", "size_bytes": 238674}
+{"extension": ".pdf", "hash": "ceee9444e8dbcdf639112a597801b60681779124aab736a235a71433d6116f17", "modified_at": "2025-09-07T15:32:20.037380+00:00", "name": "CFD_93001634772147220267.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/CFD_93001634772147220267.pdf", "relative_path": "pdf/CFD_93001634772147220267.pdf", "size_bytes": 193426}
+{"extension": ".pdf", "hash": "f879f4152d654192b6c7d9d916b8973d37e959945d684acaf5b72e73bcc1fda8", "modified_at": "2023-06-20T03:16:42+00:00", "name": "test1-presentacion-pre.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/test1-presentacion-pre.pdf", "relative_path": "pdf/test1-presentacion-pre.pdf", "size_bytes": 10916024}
+{"extension": ".pdf", "hash": "db879b945910bc32d42bfcffd1e1220218c7465276f4246a8d36fc194fd9283c", "modified_at": "2023-09-19T17:33:50+00:00", "name": "Ramos García Luis Ángel.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos García Luis Ángel.pdf", "relative_path": "pdf/Ramos García Luis Ángel.pdf", "size_bytes": 118419}
+{"extension": ".pdf", "hash": "6ff9b255080999dd97119c7cc843c39eda223641658c7810e48716d9b54a8330", "modified_at": "2023-03-30T01:49:20+00:00", "name": "Solucion_Tarea_02_PROBABILIDAD (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_02_PROBABILIDAD (1).pdf", "relative_path": "pdf/Solucion_Tarea_02_PROBABILIDAD (1).pdf", "size_bytes": 9606988}
+{"extension": ".pdf", "hash": "7a66e4008a30af811871d0437b1121a536ab013b733babae017c981ac7c3223d", "modified_at": "2025-07-01T19:50:02.735336+00:00", "name": "MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "relative_path": "pdf/MC_ACTA TUTORIAL 2DO SEMESTRE.pdf", "size_bytes": 325632}
+{"extension": ".pdf", "hash": "b9358d1c7a8696f0d2db75fea0e9dc101767644a725c4b95cbcfe5542c031053", "modified_at": "2025-07-01T19:49:46.154172+00:00", "name": "Ramos_Garcia_Luis_Angel_FEDB.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos_Garcia_Luis_Angel_FEDB.pdf", "relative_path": "pdf/Ramos_Garcia_Luis_Angel_FEDB.pdf", "size_bytes": 274356}
+{"extension": ".pdf", "hash": "4c6ba3780ca5f1d21a94c37035444dccc0a510e34d6db3f5afe1c52b1933486c", "modified_at": "2025-01-13T18:12:05.141178+00:00", "name": "Ramos Garcia_2024-2.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Ramos Garcia_2024-2.pdf", "relative_path": "pdf/Ramos Garcia_2024-2.pdf", "size_bytes": 104615}
+{"extension": ".pdf", "hash": "104e7a88a2d515e7dbd3593e2fea5f69f1bb21fb031899d6591cbc98ef5eb203", "modified_at": "2023-03-15T21:13:48+00:00", "name": "¿Quién es Katie Bouman.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/¿Quién es Katie Bouman.pdf", "relative_path": "pdf/¿Quién es Katie Bouman.pdf", "size_bytes": 4922511}
+{"extension": ".pdf", "hash": "83cbbc42252061b3507efb064bdfa0756aba98eca901faf6fc79fb872f3b9fc8", "modified_at": "2025-07-01T20:10:49.625552+00:00", "name": "3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "relative_path": "pdf/3.1 LIC. LUIS ANGEL RAMOS GARCIA.PDF", "size_bytes": 365376}
+{"extension": ".pdf", "hash": "56ff3dbca7ea85543de1d5952d688ac444a9699e2577e9c8eeef381bd73c2f10", "modified_at": "2023-06-15T06:01:40+00:00", "name": "xddd.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/xddd.pdf", "relative_path": "pdf/xddd.pdf", "size_bytes": 1174265}
+{"extension": ".pdf", "hash": "6ff9b255080999dd97119c7cc843c39eda223641658c7810e48716d9b54a8330", "modified_at": "2023-03-30T01:48:51+00:00", "name": "Solucion_Tarea_02_PROBABILIDAD.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Solucion_Tarea_02_PROBABILIDAD.pdf", "relative_path": "pdf/Solucion_Tarea_02_PROBABILIDAD.pdf", "size_bytes": 9606988}
+{"extension": ".pdf", "hash": "4d1a0f792fecefcf225eeb6a757262f18324bd78176c2c235b3b5cc9e8f4c7dc", "modified_at": "2024-12-11T22:17:33.396528+00:00", "name": "Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "relative_path": "pdf/Luis_Angel_Ramos_Garcia_seminarios_2024-2.pdf", "size_bytes": 638244}
+{"extension": ".pdf", "hash": "f5d3b66f39b624e8eff958657c9634a31cf549af312f64c849a8f4e24446d9fd", "modified_at": "2024-07-10T18:40:56+00:00", "name": "moise2006.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/moise2006.pdf", "relative_path": "pdf/moise2006.pdf", "size_bytes": 575132}
+{"extension": ".pdf", "hash": "3ccfd01ee14d002ee1d5300bd967f2799bd207bbc9b8312309810475d6bb706d", "modified_at": "2023-05-10T17:11:52+00:00", "name": "rosenblatt-1957-Perceptron.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/rosenblatt-1957-Perceptron.pdf", "relative_path": "pdf/rosenblatt-1957-Perceptron.pdf", "size_bytes": 4143406}
+{"extension": ".pdf", "hash": "2e4b5fd4d375ca876100e060b8ce7157ae2f6f36aff32ba34c5c35464ba063a8", "modified_at": "2023-02-10T22:00:41+00:00", "name": "voucherConFoto.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/voucherConFoto.pdf", "relative_path": "pdf/voucherConFoto.pdf", "size_bytes": 154820}
+{"extension": ".pdf", "hash": "4a46fa45bef8afcaa0f7cc8849727395bc080f89bab8cf3a6f63efdfa68b29d8", "modified_at": "2022-12-06T13:48:00+00:00", "name": "Turing.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Turing.pdf", "relative_path": "pdf/Turing.pdf", "size_bytes": 4085746}
+{"extension": ".pdf", "hash": "5e422213ee57d0939f2357914a8a84b9335fdfe6df70ba6ab4f394d8fb99a7bb", "modified_at": "2024-06-13T23:22:33+00:00", "name": "Tesis_James (1).pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James (1).pdf", "relative_path": "pdf/Tesis_James (1).pdf", "size_bytes": 864068}
+{"extension": ".pdf", "hash": "6ed25d2c26dbe6f998e02fbd834b7149f924ae20ed4dfa8848c3ae52b56fdb49", "modified_at": "2022-11-22T19:35:13+00:00", "name": "xdd.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/xdd.pdf", "relative_path": "pdf/xdd.pdf", "size_bytes": 1555399}
+{"extension": ".pdf", "hash": "a012159af64e1e657bb73c5f8ec9a616adc3c7639bda562e9732dc123da3ad4d", "modified_at": "2022-08-16T22:42:07+00:00", "name": "Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "relative_path": "pdf/Discrete mathematics and its applications by Rosen, Kenneth H , 8th Edition.pdf", "size_bytes": 8729085}
+{"extension": ".pdf", "hash": "4656428199891fae89d565afe00692c2e9a9be4f590baa93138ba0980f7f347c", "modified_at": "2023-02-10T23:29:01+00:00", "name": "Reinscripcion_2020.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Reinscripcion_2020.pdf", "relative_path": "pdf/Reinscripcion_2020.pdf", "size_bytes": 321527}
+{"extension": ".pdf", "hash": "1550c496323fe43b546bdc0e67a3770e1aa84ae85df21bf8a5638c484534593a", "modified_at": "2024-06-13T23:06:16+00:00", "name": "LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "relative_path": "pdf/LUIS ANGEL RAMOS GARCIA-REG TEMA.pdf", "size_bytes": 536973}
+{"extension": ".pdf", "hash": "563e6c1641ed2ce6e62972633979900d5f6b588f016cec6d63a3948ce841456f", "modified_at": "2024-06-14T21:34:48+00:00", "name": "VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "relative_path": "pdf/VOTOS APROBATORIOS RAMOS GARCIA LUIS ANGEL (1).PDF", "size_bytes": 371777}
+{"extension": ".pdf", "hash": "838910745c0c7d717215983c696be12ab8b1581dc3c652882459f0e585e0ee34", "modified_at": "2023-02-10T23:31:16+00:00", "name": "Reinscripcion2023.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Reinscripcion2023.pdf", "relative_path": "pdf/Reinscripcion2023.pdf", "size_bytes": 341525}
+{"extension": ".pdf", "hash": "38bac1b24deb267350ac287a907e39b36472fe1e35e6a9927591b86da3e57d66", "modified_at": "2023-02-10T21:54:34+00:00", "name": "voucher.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/voucher.pdf", "relative_path": "pdf/voucher.pdf", "size_bytes": 85879}
+{"extension": ".pdf", "hash": "41234164c5a65e8d09f365608ab0a0f15d4db56e7a8bfc6ab2b312749032433d", "modified_at": "2024-05-24T01:50:37+00:00", "name": "Tesis_James.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Tesis_James.pdf", "relative_path": "pdf/Tesis_James.pdf", "size_bytes": 813259}
+{"extension": ".pdf", "hash": "cf1c68e2814b40a8395d206864f4c10f87ec128457908c3ca702cf91fbd8d4b3", "modified_at": "2023-03-01T19:13:30+00:00", "name": "Presentacion_Modelacion_Matematica.pdf", "path": "/mnt/hdd_0/backups_sin_limpiar/pdf/Presentacion_Modelacion_Matematica.pdf", "relative_path": "pdf/Presentacion_Modelacion_Matematica.pdf", "size_bytes": 2371938}
+{"extension": ".png", "hash": "215875830a93fc972e0ddafd5fe1f03c6ed2ece7ae00264f6a0509ba8d295845", "modified_at": "2026-02-27T04:02:45.980549+00:00", "name": "Captura de pantalla 2026-02-26 220245.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2026-02-26 220245.png", "relative_path": "png/Captura de pantalla 2026-02-26 220245.png", "size_bytes": 166913}
+{"extension": ".png", "hash": "29dc50e5e290f2359a3e01f2029f7e28c33fda2af03be9194a56436a22d7494b", "modified_at": "2025-01-11T05:38:11.239578+00:00", "name": "Captura de pantalla 2025-01-10 233810.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 233810.png", "relative_path": "png/Captura de pantalla 2025-01-10 233810.png", "size_bytes": 723570}
+{"extension": ".png", "hash": "aed0a10c33783dd6e30d0c6b03d1da0afb9dab87fccb8be1c746086f2cc5ffee", "modified_at": "2025-01-11T05:52:07.085249+00:00", "name": "Captura de pantalla 2025-01-10 235206.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 235206.png", "relative_path": "png/Captura de pantalla 2025-01-10 235206.png", "size_bytes": 649862}
+{"extension": ".png", "hash": "779087d80fd9a3de643ed034a20400a2fb81eef6357efbf0372b87ce8c45c416", "modified_at": "2026-02-27T03:54:55.529258+00:00", "name": "Captura de pantalla 2026-02-26 215454.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2026-02-26 215454.png", "relative_path": "png/Captura de pantalla 2026-02-26 215454.png", "size_bytes": 73297}
+{"extension": ".png", "hash": "ee766222fcbcf51424b560c3811f29f242d8b99312ad77f3a917182131c4e0c3", "modified_at": "2025-01-11T05:38:25.460779+00:00", "name": "Captura de pantalla 2025-01-10 233825.png", "path": "/mnt/hdd_0/backups_sin_limpiar/png/Captura de pantalla 2025-01-10 233825.png", "relative_path": "png/Captura de pantalla 2025-01-10 233825.png", "size_bytes": 565764}
+{"extension": ".mp4", "hash": "3020bfb97d7deaa13106a0268e15c7ad886a5e4d46cf46f9bf0d39b69120e474", "modified_at": "2023-06-12T16:40:19+00:00", "name": "2023-06-11_004147486.mp4", "path": "/mnt/hdd_0/backups_sin_limpiar/media/2023-06-11_004147486.mp4", "relative_path": "media/2023-06-11_004147486.mp4", "size_bytes": 13289625}
+{"extension": ".mkv", "hash": "6518fd92831a532fedef01f76013e36705316509a0fcbc4d21b9829d2d7f2a3b", "modified_at": "2026-04-01T21:05:00.519132+00:00", "name": "Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E11.L.Tale.of.X9.mkv", "size_bytes": 805372107}
+{"extension": ".mkv", "hash": "e2e082f218566ae1c4f6b79975d3c9e6b8788c51aac6c25d1801960b6c2da0d6", "modified_at": "2026-04-01T21:04:37.713197+00:00", "name": "Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E05.XLIV.The.Princess.and.the.Bounty.Hunters.mkv", "size_bytes": 630658180}
+{"extension": ".mkv", "hash": "1fa0e2e3df3dac5eba2205cc3f63b2452fb58d37daba8eb9a94791daadcb4bfd", "modified_at": "2026-04-01T21:04:57.621549+00:00", "name": "Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E03.XLII.Samurai.versus.Samurai.mkv", "size_bytes": 1079321865}
+{"extension": ".mkv", "hash": "0d1ff273dae0fbf939f38d1d5bcad08808169c637acb69cbf783fcefeb3ffaa5", "modified_at": "2026-04-01T21:03:40.174640+00:00", "name": "Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E12.LI.Young.Jack.in.Africa.mkv", "size_bytes": 681980615}
+{"extension": ".mkv", "hash": "0ff72a18877c507dd6f5ff1bfd8cfff99129f18307c5326cf046c900cddd5100", "modified_at": "2026-04-01T21:02:23.747109+00:00", "name": "Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E02.XLI.Robo-Samurai.versus.Mondo.Bot.mkv", "size_bytes": 671530031}
+{"extension": ".mkv", "hash": "9bd95546f54f7d7bca53398db115dc5fd77b6e6a878106970f8510851e821f91", "modified_at": "2026-04-01T21:04:07.757952+00:00", "name": "Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E06.XLV.Scotsman.Saves.Jack.(1).mkv", "size_bytes": 698401851}
+{"extension": ".mkv", "hash": "67dbf53115bfa05d6dec7840ddb1533af9f170bd9a0e69b142e1bf56fc2f66ad", "modified_at": "2026-04-01T21:04:34.557230+00:00", "name": "Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E09.XLVIII.Jack.versus.Aku.mkv", "size_bytes": 563367115}
+{"extension": ".mkv", "hash": "5fbccb1556c76efae429de0b4cf9525112a78d9885544a2a975e1a093103e987", "modified_at": "2026-04-01T21:04:45.890596+00:00", "name": "Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E04.XLIII.The.Aku.Infection.mkv", "size_bytes": 675011522}
+{"extension": ".mkv", "hash": "9411a7943bdc8819d1aae28550e4f251a378989161add4a04ef12713b8c0575b", "modified_at": "2026-04-01T21:04:43.604376+00:00", "name": "Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E13.LII.Jack.and.the.Baby.mkv", "size_bytes": 863966548}
+{"extension": ".mkv", "hash": "b01b4b92273277582886c4e0c7028eb89ddf4105e9dd07f601be377c3d70747a", "modified_at": "2026-04-01T21:04:40.992192+00:00", "name": "Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E07.XLVI.Scotsman.Saves.Jack.(2).mkv", "size_bytes": 659671219}
+{"extension": ".mkv", "hash": "252e6bf7ab360007aca544fe67564fc3ce3562b87a845552d6381231a5ea64f0", "modified_at": "2026-04-01T21:04:30.949941+00:00", "name": "Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E10.XLIX.The.4.Seasons.of.Death.mkv", "size_bytes": 657271594}
+{"extension": ".mkv", "hash": "21874ff1c68038c78d1ccdd20d38a8949d86542eb79026dc2a5a15bf4a80ff00", "modified_at": "2026-04-01T21:04:55.496749+00:00", "name": "Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E01.XL.Samurai.versus.Ninja.mkv", "size_bytes": 593098156}
+{"extension": ".mkv", "hash": "2e60e40da88609aaaec6c32d002af6c1f0bf6aa91e8aeb45f36e5e201cd78f82", "modified_at": "2026-04-01T21:02:04.884562+00:00", "name": "Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 4/Samurai.Jack.S04E08.XLVII.Jack.and.the.Flying.Prince.and.Princess.mkv", "size_bytes": 703291613}
+{"extension": ".mkv", "hash": "d01e406bb85fcce61b6c87bc8e3b03849215a05d813d3161c9296dc21f0e1a08", "modified_at": "2026-04-01T21:04:58.636739+00:00", "name": "Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E08.XXI.Jack.and.the.Farting.Dragon.mkv", "size_bytes": 641682059}
+{"extension": ".mkv", "hash": "ec11473db53d9cb9b92f9f2eeda24e5c3f24790b56ed812784bdff7f3d32f0ef", "modified_at": "2026-04-01T21:03:58.047536+00:00", "name": "Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E07.XX.Jack.and.the.Monks.mkv", "size_bytes": 673339332}
+{"extension": ".mkv", "hash": "858243c8d4d6c42e36f90e0b644fa66fa4b330ffdcbd07bb020efb44679b3fec", "modified_at": "2026-04-01T21:04:42.372159+00:00", "name": "Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E04.XVII.Jack.and.the.Scotsman.(2).mkv", "size_bytes": 689837834}
+{"extension": ".mkv", "hash": "5a691f7af861547ed5857c3d8ebadc15482d7edbaa4951fe96adf75e4493b3b3", "modified_at": "2026-04-01T20:59:51.643478+00:00", "name": "Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E13.XXVI.Jack's.Sandals.mkv", "size_bytes": 637595193}
+{"extension": ".mkv", "hash": "35465646ea248fc82e31e01ed764041f19d62a36bddbad31e8aee25ed39ddc08", "modified_at": "2026-04-01T21:04:07.066003+00:00", "name": "Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E12.XXV.Jack.and.the.Spartans.mkv", "size_bytes": 443796191}
+{"extension": ".mkv", "hash": "74a29b9fab41ded0bd884d270a48c86a83f789d3d731f1191de34c0d1b5cf417", "modified_at": "2026-04-01T21:04:44.804938+00:00", "name": "Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E05.XVIII.Jack.and.the.Ultra-robots.mkv", "size_bytes": 664600162}
+{"extension": ".mkv", "hash": "442c18ef743aaf10eea59de9cbeedba9fb69dcbfddb35bd843eee8788e607125", "modified_at": "2026-04-01T21:04:15.626374+00:00", "name": "Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E06.XIX.Jack.Remembers.the.Past.mkv", "size_bytes": 662477115}
+{"extension": ".mkv", "hash": "10ca76d3c5380eeceedf37fc6b87da0be5fd4ae3642eb41c38f66c59e059336d", "modified_at": "2026-04-01T21:03:30.722958+00:00", "name": "Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E03.XVI.Jack.and.the.Smackback.mkv", "size_bytes": 583765571}
+{"extension": ".mkv", "hash": "caec9a89f7dcf27837c1c6494eec9d3daeff9b06df811cbce66c00155f473140", "modified_at": "2026-04-01T21:03:52.281950+00:00", "name": "Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E11.XXIV.Jack.is.Naked.mkv", "size_bytes": 647739961}
+{"extension": ".mkv", "hash": "78676e06325a25ebef31760475129b0bae3a664be05f91e8ece31dc7b6d8752f", "modified_at": "2026-04-01T21:03:50.194258+00:00", "name": "Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E02.XV.Jack.Tales.mkv", "size_bytes": 580671746}
+{"extension": ".mkv", "hash": "ff3d8ec8ed0c3af316cace6f6cd7efab43ab0dd7641c37c217888e8b416bf2fa", "modified_at": "2026-04-01T21:03:59.057296+00:00", "name": "Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E10.XXIII.Jack.versus.Demongo,.The.Soul.Collector.mkv", "size_bytes": 618219804}
+{"extension": ".mkv", "hash": "a51121db0dbb652cc92d1ff61c37290fc9fbc61368c6daa60dec876e56f17493", "modified_at": "2026-04-01T21:04:33.392429+00:00", "name": "Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "path": "/mnt/hdd_0/backups_sin_limpiar/media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "relative_path": "media/Samurai.Jack.S01-S04.1080p.x264/Season 2/Samurai.Jack.S02E09.XXII.Jack.and.the.Hunters.mkv", "size_bytes": 568751064}
+
+
+
+================================================
+FILE: hash_queues/backup_limpio-20260708T233057Z.jsonl.status.json
+================================================
+{
+  "status": "running",
+  "root": "/mnt/hdd_0/backups_sin_limpiar",
+  "queue_path": "/home/uzr/code/hash_queues/backup_limpio-20260708T233057Z.jsonl",
+  "count": 0,
+  "hash_threads": 12,
+  "chunk_size": 268435456,
+  "started_at": "2026-07-08T23:30:58.019112+00:00",
+  "updated_at": "2026-07-08T23:30:58.019183+00:00"
+}
+
+
+================================================
+FILE: hash_queues/disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl.status.json
+================================================
+{
+  "status": "done",
+  "root": "/media/uzr/MARTHA DOLI (INFO RECIENTE)",
+  "queue_path": "/home/uzr/code/hash_queues/disk_dc9d10b9b2739f2f-20260526T142032Z.jsonl",
+  "count": 731707,
+  "hash_threads": 7,
+  "chunk_size": 268435456,
+  "started_at": "2026-05-26T14:20:32.742131+00:00",
+  "updated_at": "2026-05-26T16:55:49.231977+00:00"
+}
+
+
+================================================
+FILE: hash_queues/disk_e6e2accb7d027956-20260526T142033Z.jsonl.status.json
+================================================
+{
+  "status": "done",
+  "root": "/media/uzr/58ACC9AFACC98848",
+  "queue_path": "/home/uzr/code/hash_queues/disk_e6e2accb7d027956-20260526T142033Z.jsonl",
+  "count": 78014,
+  "hash_threads": 7,
+  "chunk_size": 268435456,
+  "started_at": "2026-05-26T14:20:33.265235+00:00",
+  "updated_at": "2026-05-26T15:08:06.843502+00:00"
+}
+
