@@ -164,10 +164,11 @@ El proyecto se encuentra en desarrollo activo. Entre las mejoras planeadas se in
 * Métricas de rendimiento y monitoreo.
 * Pruebas automatizadas.
 * Hashing por ssh con calculo local para solo enviar hashes y hacer rsync
+
 ## Licencia
 
 Pendiente de definir.
 
 # Casos de uso
 Si tienes un montón de carpetas de distintas fuentes y no quieres filtrarlas manualmente.
-Si tienes que crear un backup de archivos para comenzando desde cero.
+Si tienes que crear un backup de archivos comenzando desde cero.
